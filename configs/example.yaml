@@ -1,0 +1,110 @@
+# ============================================================================
+# Siemens QNA2..D Sensor Simulator - Example Configuration
+# ============================================================================
+# This file configures the sensor simulator to write values to a Modbus TCP
+# server (e.g., Modbus Slave by Witte Software).
+#
+# Values use int16/uint16 encoding (1 register per measurement).
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Modbus TCP Connection Settings
+# ----------------------------------------------------------------------------
+modbus:
+  host: "127.0.0.1"        # Modbus TCP server address
+  port: 502                 # Standard Modbus TCP port
+  unit_id: 1                # Slave unit ID
+
+  # Timeout settings (milliseconds)
+  timeouts:
+    connect_ms: 3000        # Connection timeout
+    write_ms: 1000          # Write operation timeout
+
+  # Retry settings with exponential backoff
+  retry:
+    max_attempts: 3         # Number of retry attempts
+    backoff_seconds:        # Delay between retries
+      - 1.0
+      - 2.0
+      - 5.0
+
+# ----------------------------------------------------------------------------
+# Update Settings
+# ----------------------------------------------------------------------------
+update:
+  tick_seconds: 1.0         # Main loop interval
+
+  # Per-measurement update rates (seconds)
+  # Different measurements can be updated at different frequencies
+  rates_seconds:
+    temperature: 1          # Fast measurements (1 Hz)
+    humidity: 1
+    lux: 1
+    noise: 1
+    co2: 5                  # Medium measurements (0.2 Hz)
+    tvoc: 5
+    pm25: 10                # Slow measurements (0.1 Hz)
+    pm10: 10
+
+# ----------------------------------------------------------------------------
+# Sensor Definitions
+# ----------------------------------------------------------------------------
+# Each sensor has:
+#   - id: Unique identifier (used for logging and RNG seeding)
+#   - base_address: Starting Modbus register address
+#   - absolute: If true, register_map values are absolute addresses
+#               If false (default), register_map values are offsets from base_address
+#   - register_map: Mapping of measurement types to register offsets/addresses
+#
+# SCALING (applied automatically):
+#   - temperature: int16, value = °C * 10  (e.g., 25.3°C => 253)
+#   - humidity: uint16, value = % * 10     (e.g., 55.2% => 552)
+#   - noise: uint16, value = dB * 10       (e.g., 38.5dB => 385)
+#   - co2, tvoc, pm25, pm10, lux: uint16, integer values
+# ----------------------------------------------------------------------------
+
+sensors:
+  # Sensor 1: Registers 0-7
+  - id: "sensor_1"
+    base_address: 0
+    register_map:
+      temperature: 0        # Register 0: Temperature (int16, °C*10)
+      humidity: 1           # Register 1: Humidity (uint16, %*10)
+      co2: 2                # Register 2: CO2 (uint16, ppm)
+      tvoc: 3               # Register 3: TVOC (uint16, ppb)
+      pm25: 4               # Register 4: PM2.5 (uint16, µg/m³)
+      pm10: 5               # Register 5: PM10 (uint16, µg/m³)
+      lux: 6                # Register 6: Illuminance (uint16, lux)
+      noise: 7              # Register 7: Noise level (uint16, dB*10)
+
+#  # Sensor 2: Registers 20-27
+#  - id: "sensor_2"
+#    base_address: 8
+#    register_map:
+#      temperature: 0
+#      humidity: 1
+#      co2: 2
+#      tvoc: 3
+#      pm25: 4
+#      pm10: 5
+#      lux: 6
+#      noise: 7
+#
+#  # Sensor 3: Registers 40-47
+#  - id: "sensor_3"
+#    base_address: 40
+#    register_map:
+#      temperature: 0
+#      humidity: 1
+#      co2: 2
+#      tvoc: 3
+#      pm25: 4
+#      pm10: 5
+#      lux: 6
+#      noise: 7
+
+# ----------------------------------------------------------------------------
+# Logging Level
+# ----------------------------------------------------------------------------
+log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
+
