@@ -1,11 +1,15 @@
 """
-Realistic sensor data generator with correlations and noise patterns.
+Realistic sensor data generator.
+
+Provides specific patterns for known measurement types (temperature, humidity, etc.)
+and a generic sinusoidal pattern for custom/unknown measurement types.
 """
 import hashlib
 import math
 import random
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
+from models import MeasurementConfig
 from utils.clamp import clamp
 from utils.logging import get_logger
 
@@ -14,295 +18,135 @@ logger = get_logger(__name__)
 
 class SensorGenerator:
     """
-    Generates realistic sensor values with correlations and noise patterns.
+    Generates realistic sensor values for a single sensor.
 
-    Each sensor instance has its own RNG seed for reproducibility and
-    to ensure different sensors produce different values.
+    Each instance has its own RNG seed for reproducibility.
+    Known measurement types use specific patterns with correlations.
+    Unknown types use a generic sinusoidal + noise pattern.
     """
 
-    def __init__(self, sensor_id: str, seed: Optional[int] = None):
-        """
-        Initialize the generator for a specific sensor.
-
-        Args:
-            sensor_id: Unique sensor identifier (used for seeding).
-            seed: Optional explicit seed (if None, derived from sensor_id).
-        """
+    def __init__(
+        self,
+        sensor_id: str,
+        measurements: List[MeasurementConfig],
+        seed: Optional[int] = None,
+    ):
         self.sensor_id = sensor_id
+        self._measurements = {m.name: m for m in measurements}
 
-        # Derive seed from sensor_id for reproducibility
         if seed is None:
-            # Use hash to convert sensor_id string to integer seed
             hash_value = hashlib.md5(sensor_id.encode()).hexdigest()
             seed = int(hash_value[:8], 16)
 
         self.rng = random.Random(seed)
 
-        # Internal state for correlated values
-        self._current_co2: float = 520.0
-        self._current_pm25: float = 12.0
+        # State for correlated values
+        self._state: Dict[str, float] = {}
 
-        # Peak event tracking for PM
-        self._pm_peak_active: bool = False
-        self._pm_peak_start_time: float = 0.0
-        self._pm_peak_duration: float = 0.0
-        self._next_pm_peak_time: float = self.rng.uniform(60, 120)
+        # PM peak event tracking
+        self._pm_peak_active = False
+        self._pm_peak_start_time = 0.0
+        self._pm_peak_duration = 0.0
+        self._next_pm_peak_time = self.rng.uniform(60, 120)
 
-        logger.debug(f"Initialized generator for sensor '{sensor_id}' with seed {seed}")
+        logger.debug(f"Initialized generator for '{sensor_id}' (seed={seed})")
 
-    def generate_all(self, time_seconds: float) -> Dict[str, float]:
-        """
-        Generate all measurement values for a given time.
-
-        Args:
-            time_seconds: Elapsed time in seconds since simulation start.
-
-        Returns:
-            Dictionary of measurement names to values.
-        """
-        # Generate CO2 first (needed for TVOC correlation)
-        co2 = self._generate_co2(time_seconds)
-        self._current_co2 = co2
-
-        # Generate PM2.5 first (needed for PM10 correlation)
-        pm25 = self._generate_pm25(time_seconds)
-        self._current_pm25 = pm25
-
-        return {
-            "temperature": self._generate_temperature(time_seconds),
-            "humidity": self._generate_humidity(time_seconds),
-            "co2": co2,
-            "tvoc": self._generate_tvoc(time_seconds),
-            "pm25": pm25,
-            "pm10": self._generate_pm10(time_seconds),
-            "lux": self._generate_lux(time_seconds),
-            "noise": self._generate_noise(time_seconds),
-        }
-
-    def generate_single(self, measurement: str, time_seconds: float) -> float:
-        """
-        Generate a single measurement value.
-
-        Note: For correlated measurements (tvoc, pm10), this will use
-        the last generated co2/pm25 values.
-
-        Args:
-            measurement: Measurement type name.
-            time_seconds: Elapsed time in seconds.
-
-        Returns:
-            Generated measurement value.
-        """
-        generators = {
-            "temperature": self._generate_temperature,
-            "humidity": self._generate_humidity,
-            "co2": self._generate_co2,
-            "tvoc": self._generate_tvoc,
-            "pm25": self._generate_pm25,
-            "pm10": self._generate_pm10,
-            "lux": self._generate_lux,
-            "noise": self._generate_noise,
-        }
-
-        generator = generators.get(measurement)
-        if generator is None:
-            logger.warning(f"Unknown measurement type: {measurement}")
+    def generate(self, name: str, time_seconds: float) -> float:
+        """Generate a value for the named measurement."""
+        config = self._measurements.get(name)
+        if config is None:
+            logger.warning(f"Unknown measurement '{name}' for sensor '{self.sensor_id}'")
             return 0.0
 
-        value = generator(time_seconds)
+        generators = {
+            "temperature": self._gen_temperature,
+            "humidity": self._gen_humidity,
+            "co2": self._gen_co2,
+            "tvoc": self._gen_tvoc,
+            "pm25": self._gen_pm25,
+            "pm10": self._gen_pm10,
+            "lux": self._gen_lux,
+            "noise": self._gen_noise,
+        }
 
-        # Update state for correlated values
-        if measurement == "co2":
-            self._current_co2 = value
-        elif measurement == "pm25":
-            self._current_pm25 = value
+        gen_fn = generators.get(name)
+        if gen_fn:
+            value = gen_fn(time_seconds)
+        else:
+            value = self._gen_generic(config, time_seconds)
 
+        value = clamp(value, config.min_value, config.max_value)
+        self._state[name] = value
         return value
 
-    def _generate_temperature(self, t: float) -> float:
-        """
-        Generate temperature value.
+    def generate_all(self, time_seconds: float) -> Dict[str, float]:
+        """Generate all measurement values (dependency-ordered)."""
+        names = self._dependency_order()
+        return {name: self.generate(name, time_seconds) for name in names}
 
-        Pattern: base 24°C, sinusoidal variation ±2°C, noise ±0.1°C
-        Range: 18°C to 30°C
-        """
-        base = 24.0
-        sin_component = math.sin(t / 120.0) * 2.0
-        noise = self.rng.gauss(0, 0.1)
+    def _dependency_order(self) -> List[str]:
+        """Order measurements so dependencies come first (co2 before tvoc, etc.)."""
+        priorities = {"co2": 0, "pm25": 0, "tvoc": 1, "pm10": 1}
+        names = list(self._measurements.keys())
+        names.sort(key=lambda n: priorities.get(n, 0))
+        return names
 
-        value = base + sin_component + noise
-        return clamp(value, 18.0, 30.0)
+    # -- Known measurement patterns --
 
-    def _generate_humidity(self, t: float) -> float:
-        """
-        Generate humidity value.
+    def _gen_temperature(self, t: float) -> float:
+        return 24.0 + math.sin(t / 120.0) * 2.0 + self.rng.gauss(0, 0.1)
 
-        Pattern: base 55%, sinusoidal variation ±7%, noise ±0.3%
-        Range: 30% to 80%
-        """
-        base = 55.0
-        sin_component = math.sin(t / 180.0) * 7.0
-        noise = self.rng.gauss(0, 0.3)
+    def _gen_humidity(self, t: float) -> float:
+        return 55.0 + math.sin(t / 180.0) * 7.0 + self.rng.gauss(0, 0.3)
 
-        value = base + sin_component + noise
-        return clamp(value, 30.0, 80.0)
+    def _gen_co2(self, t: float) -> float:
+        return 520.0 + max(0, math.sin(t / 90.0)) * 300.0 + self.rng.gauss(0, 20)
 
-    def _generate_co2(self, t: float) -> float:
-        """
-        Generate CO2 value.
+    def _gen_tvoc(self, t: float) -> float:
+        co2 = self._state.get("co2", 520.0)
+        return 150.0 + (co2 - 400.0) * 0.4 + self.rng.gauss(0, 25)
 
-        Pattern: base 520ppm, sinusoidal peaks up to +300ppm, noise ±20ppm
-        Range: 400ppm to 1500ppm
-        """
-        base = 520.0
-        # Use max(0, sin) to create peaks rather than valleys
-        sin_component = max(0, math.sin(t / 90.0)) * 300.0
-        noise = self.rng.gauss(0, 20)
-
-        value = base + sin_component + noise
-        return clamp(value, 400.0, 1500.0)
-
-    def _generate_tvoc(self, t: float) -> float:
-        """
-        Generate TVOC value correlated with CO2.
-
-        Pattern: 150ppb base + CO2 correlation (0.4 factor) + noise ±25ppb
-        Range: 50ppb to 1200ppb
-        """
-        base = 150.0
-        co2_correlation = (self._current_co2 - 400.0) * 0.4
-        noise = self.rng.gauss(0, 25)
-
-        value = base + co2_correlation + noise
-        return clamp(value, 50.0, 1200.0)
-
-    def _generate_pm25(self, t: float) -> float:
-        """
-        Generate PM2.5 value with occasional peaks.
-
-        Pattern: base 12µg/m³, noise ±2, occasional peak events
-        Range: 0 to 200µg/m³
-        """
-        base = 12.0
-        noise = self.rng.gauss(0, 2)
-
-        # Handle peak events
-        peak_contribution = 0.0
+    def _gen_pm25(self, t: float) -> float:
+        base = 12.0 + self.rng.gauss(0, 2)
+        peak = 0.0
 
         if self._pm_peak_active:
-            # Check if peak should end
-            elapsed_in_peak = t - self._pm_peak_start_time
-            if elapsed_in_peak > self._pm_peak_duration:
+            elapsed = t - self._pm_peak_start_time
+            if elapsed > self._pm_peak_duration:
                 self._pm_peak_active = False
                 self._next_pm_peak_time = t + self.rng.uniform(60, 120)
             else:
-                # Gaussian-shaped peak
-                peak_center = self._pm_peak_duration / 2
-                peak_intensity = 50 + self.rng.uniform(0, 30)
+                center = self._pm_peak_duration / 2
+                intensity = 50 + self.rng.uniform(0, 30)
                 sigma = self._pm_peak_duration / 4
-                peak_contribution = peak_intensity * math.exp(
-                    -((elapsed_in_peak - peak_center) ** 2) / (2 * sigma ** 2)
+                peak = intensity * math.exp(
+                    -((elapsed - center) ** 2) / (2 * sigma ** 2)
                 )
-        else:
-            # Check if it's time for a new peak
-            if t >= self._next_pm_peak_time:
-                self._pm_peak_active = True
-                self._pm_peak_start_time = t
-                self._pm_peak_duration = self.rng.uniform(10, 20)
+        elif t >= self._next_pm_peak_time:
+            self._pm_peak_active = True
+            self._pm_peak_start_time = t
+            self._pm_peak_duration = self.rng.uniform(10, 20)
 
-        value = base + noise + peak_contribution
-        return clamp(value, 0.0, 200.0)
+        return base + peak
 
-    def _generate_pm10(self, t: float) -> float:
-        """
-        Generate PM10 value correlated with PM2.5.
+    def _gen_pm10(self, t: float) -> float:
+        pm25 = self._state.get("pm25", 12.0)
+        return pm25 + self.rng.uniform(3, 20)
 
-        Pattern: PM2.5 + random offset (3-20µg/m³)
-        Range: 0 to 300µg/m³
-        """
-        offset = self.rng.uniform(3, 20)
-        value = self._current_pm25 + offset
-        return clamp(value, 0.0, 300.0)
+    def _gen_lux(self, t: float) -> float:
+        sin_norm = (math.sin(t / 300.0) + 1) / 2
+        return 50.0 + sin_norm * 800.0 + self.rng.gauss(0, 10)
 
-    def _generate_lux(self, t: float) -> float:
-        """
-        Generate illuminance value.
+    def _gen_noise(self, t: float) -> float:
+        return 38.0 + math.sin(t / 20.0) * 3.0 + self.rng.gauss(0, 1)
 
-        Pattern: 50 lux base + normalized sinusoidal variation * 800, noise ±10
-        Range: 0 to 2000 lux
-        """
-        base = 50.0
-        # Normalize sin to 0-1 range for lighting pattern
-        sin_normalized = (math.sin(t / 300.0) + 1) / 2
-        sin_component = sin_normalized * 800.0
-        noise = self.rng.gauss(0, 10)
+    # -- Generic pattern for custom measurements --
 
-        value = base + sin_component + noise
-        return clamp(value, 0.0, 2000.0)
-
-    def _generate_noise(self, t: float) -> float:
-        """
-        Generate noise level value.
-
-        Pattern: base 38dB, sinusoidal variation ±3dB, noise ±1dB
-        Range: 25dB to 75dB
-        """
-        base = 38.0
-        sin_component = math.sin(t / 20.0) * 3.0
-        noise = self.rng.gauss(0, 1)
-
-        value = base + sin_component + noise
-        return clamp(value, 25.0, 75.0)
-
-
-class MultiSensorGenerator:
-    """
-    Manages multiple sensor generators.
-    """
-
-    def __init__(self):
-        """Initialize the multi-sensor generator."""
-        self._generators: Dict[str, SensorGenerator] = {}
-
-    def add_sensor(self, sensor_id: str, seed: Optional[int] = None) -> SensorGenerator:
-        """
-        Add a sensor generator.
-
-        Args:
-            sensor_id: Unique sensor identifier.
-            seed: Optional explicit seed.
-
-        Returns:
-            The created sensor generator.
-        """
-        generator = SensorGenerator(sensor_id, seed)
-        self._generators[sensor_id] = generator
-        return generator
-
-    def get_generator(self, sensor_id: str) -> Optional[SensorGenerator]:
-        """
-        Get a sensor generator by ID.
-
-        Args:
-            sensor_id: Sensor identifier.
-
-        Returns:
-            The sensor generator, or None if not found.
-        """
-        return self._generators.get(sensor_id)
-
-    def generate_all(self, time_seconds: float) -> Dict[str, Dict[str, float]]:
-        """
-        Generate values for all sensors.
-
-        Args:
-            time_seconds: Elapsed time in seconds.
-
-        Returns:
-            Dictionary mapping sensor_id to measurement dictionary.
-        """
-        result = {}
-        for sensor_id, generator in self._generators.items():
-            result[sensor_id] = generator.generate_all(time_seconds)
-        return result
-
+    def _gen_generic(self, config: MeasurementConfig, t: float) -> float:
+        """Sinusoidal + noise pattern based on configured range."""
+        mid = (config.min_value + config.max_value) / 2
+        amplitude = (config.max_value - config.min_value) * 0.15
+        noise_std = amplitude * 0.05
+        # Derive a unique period from the measurement name
+        period = 120.0 + (hash(config.name) % 180)
+        return mid + math.sin(t / period) * amplitude + self.rng.gauss(0, noise_std)

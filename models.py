@@ -1,8 +1,33 @@
 """
 Data models for the sensor simulator.
+
+Supports all standard Modbus data types with configurable endianness per sensor.
 """
-from typing import Dict, List, Optional
+from enum import Enum
+from typing import Dict, List, Literal, Optional
+
 from pydantic import BaseModel, Field, field_validator
+
+
+class DataType(str, Enum):
+    """Supported Modbus data types."""
+    UINT16 = "uint16"
+    INT16 = "int16"
+    UINT32 = "uint32"
+    INT32 = "int32"
+    FLOAT32 = "float32"
+    FLOAT64 = "float64"
+
+
+# Number of 16-bit registers required for each data type
+REGISTERS_PER_TYPE: Dict[DataType, int] = {
+    DataType.UINT16: 1,
+    DataType.INT16: 1,
+    DataType.UINT32: 2,
+    DataType.INT32: 2,
+    DataType.FLOAT32: 2,   # 2 x 16-bit = 32 bit
+    DataType.FLOAT64: 4,   # 4 x 16-bit = 64 bit
+}
 
 
 class ModbusConfig(BaseModel):
@@ -16,124 +41,55 @@ class ModbusConfig(BaseModel):
     backoff_seconds: List[float] = Field(default_factory=lambda: [1.0, 2.0, 5.0])
 
 
-class RatesConfig(BaseModel):
-    """Update rates for each measurement type in seconds."""
-    temperature: float = 1.0
-    humidity: float = 1.0
-    lux: float = 1.0
-    noise: float = 1.0
-    co2: float = 5.0
-    tvoc: float = 5.0
-    pm25: float = 10.0
-    pm10: float = 10.0
+class MeasurementConfig(BaseModel):
+    """Configuration for a single measurement within a sensor."""
+    name: str
+    offset: int
+    data_type: DataType = DataType.UINT16
+    scale: float = 1.0
+    min_value: float = 0.0
+    max_value: float = 65535.0
+    update_rate: float = 1.0
 
-
-class UpdateConfig(BaseModel):
-    """Main loop update configuration."""
-    tick_seconds: float = 1.0
-    rates: RatesConfig = Field(default_factory=RatesConfig)
-
-
-class RegisterMap(BaseModel):
-    """Mapping of measurement names to register offsets."""
-    temperature: int = 0
-    humidity: int = 1
-    co2: int = 2
-    tvoc: int = 3
-    pm25: int = 4
-    pm10: int = 5
-    lux: int = 6
-    noise: int = 7
-
-    def to_dict(self) -> Dict[str, int]:
-        """Convert register map to dictionary."""
-        return {
-            "temperature": self.temperature,
-            "humidity": self.humidity,
-            "co2": self.co2,
-            "tvoc": self.tvoc,
-            "pm25": self.pm25,
-            "pm10": self.pm10,
-            "lux": self.lux,
-            "noise": self.noise,
-        }
+    @property
+    def register_count(self) -> int:
+        """Number of 16-bit registers used by this measurement."""
+        return REGISTERS_PER_TYPE[self.data_type]
 
 
 class SensorConfig(BaseModel):
     """Configuration for a single sensor."""
     id: str
     base_address: int = 0
-    absolute: bool = False
-    register_map: RegisterMap = Field(default_factory=RegisterMap)
+    byte_order: Literal["big", "little"] = "big"
+    word_order: Literal["big", "little"] = "big"
+    measurements: List[MeasurementConfig] = Field(default_factory=list)
 
-    def get_register_address(self, measurement: str) -> int:
-        """
-        Get the actual Modbus register address for a measurement.
+    def get_measurement(self, name: str) -> Optional[MeasurementConfig]:
+        """Find a measurement by name."""
+        for m in self.measurements:
+            if m.name == name:
+                return m
+        return None
 
-        Args:
-            measurement: Name of the measurement (temperature, humidity, etc.)
-
-        Returns:
-            The absolute register address.
-        """
-        offset = getattr(self.register_map, measurement)
-        if self.absolute:
-            return offset
-        return self.base_address + offset
+    def get_register_address(self, measurement_name: str) -> int:
+        """Get the absolute register address for a measurement."""
+        m = self.get_measurement(measurement_name)
+        if m is None:
+            raise ValueError(f"Unknown measurement: {measurement_name}")
+        return self.base_address + m.offset
 
 
 class AppConfig(BaseModel):
     """Complete application configuration."""
     modbus: ModbusConfig = Field(default_factory=ModbusConfig)
-    update: UpdateConfig = Field(default_factory=UpdateConfig)
     sensors: List[SensorConfig] = Field(default_factory=list)
+    tick_seconds: float = 1.0
     log_level: str = "INFO"
 
     @field_validator("sensors", mode="before")
     @classmethod
     def validate_sensors(cls, v):
-        """Ensure sensors is a list."""
         if v is None:
             return []
         return v
-
-
-# Measurement types available in the simulator
-MEASUREMENT_TYPES = [
-    "temperature",
-    "humidity",
-    "co2",
-    "tvoc",
-    "pm25",
-    "pm10",
-    "lux",
-    "noise",
-]
-
-
-# Scaling factors for each measurement type
-# Format: (scale_factor, is_signed)
-SCALING_CONFIG = {
-    "temperature": (10, True),    # int16, value = °C * 10
-    "humidity": (10, False),       # uint16, value = % * 10
-    "noise": (10, False),          # uint16, value = dB * 10
-    "co2": (1, False),             # uint16, integer
-    "tvoc": (1, False),            # uint16, integer
-    "pm25": (1, False),            # uint16, integer
-    "pm10": (1, False),            # uint16, integer
-    "lux": (1, False),             # uint16, integer
-}
-
-
-# Value ranges for clamping (min, max) - in real units before scaling
-VALUE_RANGES = {
-    "temperature": (-40.0, 80.0),
-    "humidity": (0.0, 100.0),
-    "noise": (0.0, 130.0),
-    "co2": (0, 5000),
-    "tvoc": (0, 5000),
-    "pm25": (0, 500),
-    "pm10": (0, 500),
-    "lux": (0, 65535),
-}
-

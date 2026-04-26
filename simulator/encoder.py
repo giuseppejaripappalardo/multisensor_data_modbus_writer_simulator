@@ -1,111 +1,165 @@
 """
-Value encoder with scaling and clamping for Modbus registers.
+Value encoder for Modbus registers.
+
+Supports all standard Modbus data types (uint16, int16, uint32, int32, float32, float64)
+with configurable byte order and word order (endianness).
+
+Endianness combinations:
+  byte_order="big",  word_order="big"    -> AB CD  (Big Endian, standard Modbus)
+  byte_order="big",  word_order="little" -> CD AB  (Word-swapped)
+  byte_order="little", word_order="big"  -> BA DC  (Byte-swapped)
+  byte_order="little", word_order="little" -> DC BA (Little Endian)
 """
-from typing import Dict, Tuple
+import struct
+from typing import List
 
-from models import SCALING_CONFIG, VALUE_RANGES
+from models import DataType
 from utils.clamp import clamp
-from utils.logging import get_logger
-
-logger = get_logger(__name__)
 
 
-def encode_value(measurement: str, raw_value: float) -> int:
+def encode_value(
+    raw_value: float,
+    data_type: DataType,
+    scale: float = 1.0,
+    min_value: float = 0.0,
+    max_value: float = 65535.0,
+    byte_order: str = "big",
+    word_order: str = "big",
+) -> List[int]:
     """
-    Encode a raw measurement value to a Modbus register value.
-
-    Applies:
-    1. Clamping to valid range
-    2. Scaling factor multiplication
-    3. Conversion to int16/uint16
+    Encode a raw measurement value into one or more Modbus register values.
 
     Args:
-        measurement: Measurement type name.
-        raw_value: Raw value in real units.
+        raw_value: Value in real units.
+        data_type: Target Modbus data type.
+        scale: Multiplier applied before encoding (e.g., 10 for 1 decimal place).
+        min_value: Minimum allowed value (before scaling).
+        max_value: Maximum allowed value (before scaling).
+        byte_order: Byte order within each 16-bit register ("big" or "little").
+        word_order: Word order for multi-register types ("big" or "little").
 
     Returns:
-        Encoded register value (int).
+        List of uint16 register values.
     """
-    # Get scaling config
-    scale_factor, is_signed = SCALING_CONFIG.get(measurement, (1, False))
+    clamped = clamp(raw_value, min_value, max_value)
+    scaled = clamped * scale
 
-    # Get value range for clamping
-    min_val, max_val = VALUE_RANGES.get(measurement, (0, 65535))
+    if data_type == DataType.UINT16:
+        int_val = clamp(int(round(scaled)), 0, 0xFFFF) & 0xFFFF
+        if byte_order == "little":
+            int_val = ((int_val & 0xFF) << 8) | ((int_val >> 8) & 0xFF)
+        return [int_val]
 
-    # Clamp to valid range
-    clamped = clamp(raw_value, min_val, max_val)
+    elif data_type == DataType.INT16:
+        int_val = clamp(int(round(scaled)), -32768, 32767)
+        if int_val < 0:
+            int_val += 0x10000
+        int_val &= 0xFFFF
+        if byte_order == "little":
+            int_val = ((int_val & 0xFF) << 8) | ((int_val >> 8) & 0xFF)
+        return [int_val]
 
-    # Apply scaling
-    scaled = clamped * scale_factor
+    elif data_type == DataType.UINT32:
+        int_val = clamp(int(round(scaled)), 0, 0xFFFFFFFF)
+        packed = struct.pack(">I", int_val)
+        return _bytes_to_registers(packed, byte_order, word_order)
 
-    # Convert to integer
-    int_value = int(round(scaled))
+    elif data_type == DataType.INT32:
+        int_val = clamp(int(round(scaled)), -2147483648, 2147483647)
+        packed = struct.pack(">i", int_val)
+        return _bytes_to_registers(packed, byte_order, word_order)
 
-    # Clamp to register range
-    if is_signed:
-        # int16 range: -32768 to 32767
-        int_value = clamp(int_value, -32768, 32767)
-        # Convert to unsigned representation for Modbus
-        if int_value < 0:
-            int_value = int_value + 65536
+    elif data_type == DataType.FLOAT32:
+        packed = struct.pack(">f", float(scaled))
+        return _bytes_to_registers(packed, byte_order, word_order)
+
+    elif data_type == DataType.FLOAT64:
+        packed = struct.pack(">d", float(scaled))
+        return _bytes_to_registers(packed, byte_order, word_order)
+
     else:
-        # uint16 range: 0 to 65535
-        int_value = clamp(int_value, 0, 65535)
-
-    return int_value
+        raise ValueError(f"Unsupported data type: {data_type}")
 
 
-def encode_measurements(measurements: Dict[str, float]) -> Dict[str, Tuple[float, int]]:
+def decode_value(
+    registers: List[int],
+    data_type: DataType,
+    scale: float = 1.0,
+    byte_order: str = "big",
+    word_order: str = "big",
+) -> float:
     """
-    Encode multiple measurement values.
+    Decode Modbus register(s) back to a real-unit value.
 
     Args:
-        measurements: Dictionary of measurement name to raw value.
-
-    Returns:
-        Dictionary of measurement name to (raw_value, encoded_value) tuple.
-    """
-    result = {}
-    for name, raw_value in measurements.items():
-        encoded = encode_value(name, raw_value)
-        result[name] = (raw_value, encoded)
-    return result
-
-
-def decode_value(measurement: str, register_value: int) -> float:
-    """
-    Decode a Modbus register value back to real units.
-
-    This is useful for logging and debugging.
-
-    Args:
-        measurement: Measurement type name.
-        register_value: Encoded register value.
+        registers: List of uint16 register values.
+        data_type: Source Modbus data type.
+        scale: Divisor applied after decoding.
+        byte_order: Byte order within each 16-bit register.
+        word_order: Word order for multi-register types.
 
     Returns:
         Decoded value in real units.
     """
-    scale_factor, is_signed = SCALING_CONFIG.get(measurement, (1, False))
+    packed = _registers_to_bytes(registers, byte_order, word_order)
 
-    if is_signed:
-        # Convert from unsigned to signed
-        if register_value > 32767:
-            register_value = register_value - 65536
+    if data_type == DataType.UINT16:
+        value = struct.unpack(">H", packed)[0]
+    elif data_type == DataType.INT16:
+        value = struct.unpack(">h", packed)[0]
+    elif data_type == DataType.UINT32:
+        value = struct.unpack(">I", packed)[0]
+    elif data_type == DataType.INT32:
+        value = struct.unpack(">i", packed)[0]
+    elif data_type == DataType.FLOAT32:
+        value = struct.unpack(">f", packed)[0]
+    elif data_type == DataType.FLOAT64:
+        value = struct.unpack(">d", packed)[0]
+    else:
+        raise ValueError(f"Unsupported data type: {data_type}")
 
-    return register_value / scale_factor
+    return value / scale if scale != 0 else value
 
 
-def get_scaling_info(measurement: str) -> Tuple[int, bool, Tuple[float, float]]:
+def _bytes_to_registers(packed: bytes, byte_order: str, word_order: str) -> List[int]:
     """
-    Get scaling information for a measurement type.
-
-    Args:
-        measurement: Measurement type name.
-
-    Returns:
-        Tuple of (scale_factor, is_signed, (min_val, max_val)).
+    Convert packed big-endian bytes into 16-bit register values
+    applying byte_order and word_order.
     """
-    scale_factor, is_signed = SCALING_CONFIG.get(measurement, (1, False))
-    value_range = VALUE_RANGES.get(measurement, (0, 65535))
-    return scale_factor, is_signed, value_range
+    # Split into 16-bit words (big-endian byte order within each word)
+    words = []
+    for i in range(0, len(packed), 2):
+        words.append((packed[i] << 8) | packed[i + 1])
 
+    # Swap bytes within each word if little-endian byte order
+    if byte_order == "little":
+        words = [((w & 0xFF) << 8) | ((w >> 8) & 0xFF) for w in words]
+
+    # Reverse word order if little-endian word order
+    if word_order == "little":
+        words = words[::-1]
+
+    return words
+
+
+def _registers_to_bytes(registers: List[int], byte_order: str, word_order: str) -> bytes:
+    """
+    Convert 16-bit register values back to big-endian packed bytes,
+    reversing byte_order and word_order.
+    """
+    regs = list(registers)
+
+    # Reverse word order
+    if word_order == "little":
+        regs = regs[::-1]
+
+    # Reverse byte swap within each word
+    if byte_order == "little":
+        regs = [((r & 0xFF) << 8) | ((r >> 8) & 0xFF) for r in regs]
+
+    # Reconstruct big-endian bytes
+    packed = b""
+    for r in regs:
+        packed += struct.pack(">H", r & 0xFFFF)
+
+    return packed

@@ -1,110 +1,181 @@
 # ============================================================================
-# Siemens QNA2..D Sensor Simulator - Example Configuration
+# Sensor Simulator - Example Configuration
 # ============================================================================
-# This file configures the sensor simulator to write values to a Modbus TCP
-# server (e.g., Modbus Slave by Witte Software).
 #
-# Values use int16/uint16 encoding (1 register per measurement).
+# Data types supported:
+#   uint16   - 1 register  (0 to 65535)
+#   int16    - 1 register  (-32768 to 32767)
+#   uint32   - 2 registers (0 to 4294967295)
+#   int32    - 2 registers (-2147483648 to 2147483647)
+#   float32  - 2 registers (IEEE 754 single precision)
+#   float64  - 4 registers (IEEE 754 double precision)
+#
+# Endianness (per sensor):
+#   byte_order: "big" or "little"   (byte order within each 16-bit register)
+#   word_order: "big" or "little"   (register order for multi-register types)
+#
+#   big/big     = AB CD  (standard Modbus / Big Endian)
+#   big/little  = CD AB  (word-swapped)
+#   little/big  = BA DC  (byte-swapped)
+#   little/little = DC BA (Little Endian)
+#
+# Measurement fields:
+#   name        - Identifier (known names get realistic patterns, others use generic)
+#   offset      - Register offset from sensor base_address
+#   data_type   - One of the types above
+#   scale       - Multiplier before encoding (e.g., 10 = 1 decimal place for int types)
+#   min_value   - Minimum raw value (before scaling)
+#   max_value   - Maximum raw value (before scaling)
+#   update_rate - Update interval in seconds
+#
+# Known measurement names with realistic generation patterns:
+#   temperature, humidity, co2, tvoc, pm25, pm10, lux, noise
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-# Modbus TCP Connection Settings
-# ----------------------------------------------------------------------------
+# -- Modbus TCP connection --
 modbus:
-  host: "127.0.0.1"        # Modbus TCP server address
-  port: 502                 # Standard Modbus TCP port
-  unit_id: 1                # Slave unit ID
+  host: "127.0.0.1"
+  port: 502
+  unit_id: 1
+  connect_timeout_ms: 3000
+  write_timeout_ms: 1000
+  max_retry_attempts: 3
+  backoff_seconds: [1.0, 2.0, 5.0]
 
-  # Timeout settings (milliseconds)
-  timeouts:
-    connect_ms: 3000        # Connection timeout
-    write_ms: 1000          # Write operation timeout
+# -- Main loop --
+tick_seconds: 1.0
 
-  # Retry settings with exponential backoff
-  retry:
-    max_attempts: 3         # Number of retry attempts
-    backoff_seconds:        # Delay between retries
-      - 1.0
-      - 2.0
-      - 5.0
+# -- Logging --
+log_level: "INFO"
 
-# ----------------------------------------------------------------------------
-# Update Settings
-# ----------------------------------------------------------------------------
-update:
-  tick_seconds: 1.0         # Main loop interval
-
-  # Per-measurement update rates (seconds)
-  # Different measurements can be updated at different frequencies
-  rates_seconds:
-    temperature: 1          # Fast measurements (1 Hz)
-    humidity: 1
-    lux: 1
-    noise: 1
-    co2: 5                  # Medium measurements (0.2 Hz)
-    tvoc: 5
-    pm25: 10                # Slow measurements (0.1 Hz)
-    pm10: 10
-
-# ----------------------------------------------------------------------------
-# Sensor Definitions
-# ----------------------------------------------------------------------------
-# Each sensor has:
-#   - id: Unique identifier (used for logging and RNG seeding)
-#   - base_address: Starting Modbus register address
-#   - absolute: If true, register_map values are absolute addresses
-#               If false (default), register_map values are offsets from base_address
-#   - register_map: Mapping of measurement types to register offsets/addresses
-#
-# SCALING (applied automatically):
-#   - temperature: int16, value = °C * 10  (e.g., 25.3°C => 253)
-#   - humidity: uint16, value = % * 10     (e.g., 55.2% => 552)
-#   - noise: uint16, value = dB * 10       (e.g., 38.5dB => 385)
-#   - co2, tvoc, pm25, pm10, lux: uint16, integer values
-# ----------------------------------------------------------------------------
-
+# -- Sensors --
 sensors:
-  # Sensor 1: Registers 0-7
-  - id: "sensor_1"
+
+  # ----------------------------------------------------------------
+  # Sensor 1: Indoor air quality (uint16 encoding, standard Modbus)
+  # ----------------------------------------------------------------
+  - id: "indoor_aq"
     base_address: 0
-    register_map:
-      temperature: 0        # Register 0: Temperature (int16, °C*10)
-      humidity: 1           # Register 1: Humidity (uint16, %*10)
-      co2: 2                # Register 2: CO2 (uint16, ppm)
-      tvoc: 3               # Register 3: TVOC (uint16, ppb)
-      pm25: 4               # Register 4: PM2.5 (uint16, µg/m³)
-      pm10: 5               # Register 5: PM10 (uint16, µg/m³)
-      lux: 6                # Register 6: Illuminance (uint16, lux)
-      noise: 7              # Register 7: Noise level (uint16, dB*10)
+    byte_order: "big"
+    word_order: "big"
+    measurements:
+      - name: "temperature"
+        offset: 0
+        data_type: "int16"
+        scale: 10                # 25.3°C -> 253
+        min_value: -40.0
+        max_value: 80.0
+        update_rate: 1.0
 
-#  # Sensor 2: Registers 20-27
-#  - id: "sensor_2"
-#    base_address: 8
-#    register_map:
-#      temperature: 0
-#      humidity: 1
-#      co2: 2
-#      tvoc: 3
-#      pm25: 4
-#      pm10: 5
-#      lux: 6
-#      noise: 7
+      - name: "humidity"
+        offset: 1
+        data_type: "uint16"
+        scale: 10                # 55.2% -> 552
+        min_value: 0.0
+        max_value: 100.0
+        update_rate: 1.0
+
+      - name: "co2"
+        offset: 2
+        data_type: "uint16"
+        scale: 1
+        min_value: 400.0
+        max_value: 5000.0
+        update_rate: 5.0
+
+      - name: "tvoc"
+        offset: 3
+        data_type: "uint16"
+        scale: 1
+        min_value: 0.0
+        max_value: 5000.0
+        update_rate: 5.0
+
+      - name: "pm25"
+        offset: 4
+        data_type: "uint16"
+        scale: 1
+        min_value: 0.0
+        max_value: 500.0
+        update_rate: 10.0
+
+      - name: "pm10"
+        offset: 5
+        data_type: "uint16"
+        scale: 1
+        min_value: 0.0
+        max_value: 500.0
+        update_rate: 10.0
+
+      - name: "lux"
+        offset: 6
+        data_type: "uint16"
+        scale: 1
+        min_value: 0.0
+        max_value: 65535.0
+        update_rate: 1.0
+
+      - name: "noise"
+        offset: 7
+        data_type: "uint16"
+        scale: 10
+        min_value: 0.0
+        max_value: 130.0
+        update_rate: 1.0
+
+  # ----------------------------------------------------------------
+  # Sensor 2: High-precision weather station (float32 encoding)
+  # Uses 2 registers per measurement -> offsets increment by 2
+  # ----------------------------------------------------------------
+  - id: "weather_station"
+    base_address: 100
+    byte_order: "big"
+    word_order: "big"
+    measurements:
+      - name: "temperature"
+        offset: 0
+        data_type: "float32"     # Stores 25.3 as IEEE 754 float
+        scale: 1.0
+        min_value: -40.0
+        max_value: 80.0
+        update_rate: 1.0
+
+      - name: "humidity"
+        offset: 2               # float32 = 2 registers, so next offset is +2
+        data_type: "float32"
+        scale: 1.0
+        min_value: 0.0
+        max_value: 100.0
+        update_rate: 1.0
+
+      - name: "lux"
+        offset: 4
+        data_type: "float32"
+        scale: 1.0
+        min_value: 0.0
+        max_value: 100000.0
+        update_rate: 2.0
+
+#  # ----------------------------------------------------------------
+#  # Sensor 3: Energy meter (32-bit counters, little-endian device)
+#  # ----------------------------------------------------------------
+#  - id: "energy_meter"
+#    base_address: 200
+#    byte_order: "big"
+#    word_order: "little"        # CD AB word order (common in some PLCs)
+#    measurements:
+#      - name: "power"
+#        offset: 0
+#        data_type: "uint32"
+#        scale: 1
+#        min_value: 0.0
+#        max_value: 100000.0
+#        update_rate: 1.0
 #
-#  # Sensor 3: Registers 40-47
-#  - id: "sensor_3"
-#    base_address: 40
-#    register_map:
-#      temperature: 0
-#      humidity: 1
-#      co2: 2
-#      tvoc: 3
-#      pm25: 4
-#      pm10: 5
-#      lux: 6
-#      noise: 7
-
-# ----------------------------------------------------------------------------
-# Logging Level
-# ----------------------------------------------------------------------------
-log_level: "INFO"           # DEBUG, INFO, WARNING, ERROR
-
+#      - name: "energy"
+#        offset: 2
+#        data_type: "float64"    # 4 registers for high-precision energy counter
+#        scale: 1.0
+#        min_value: 0.0
+#        max_value: 999999999.0
+#        update_rate: 5.0

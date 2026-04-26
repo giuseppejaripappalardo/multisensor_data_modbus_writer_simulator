@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(python:*)",
+      "Bash(gh repo:*)",
+      "Bash(gh api:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:apollo3zehn.github.io)"
+    ]
+  }
+}

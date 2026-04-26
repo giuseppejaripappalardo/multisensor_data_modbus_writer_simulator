@@ -1,120 +1,43 @@
 """
-Multi-rate scheduler for sensor measurements.
+Sensor simulation orchestrator with per-measurement update rates.
 """
 import time
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Tuple
 
-from models import AppConfig, SensorConfig, RatesConfig, MEASUREMENT_TYPES
+from models import AppConfig, SensorConfig, MeasurementConfig
 from modbus_client import ModbusClient
-from simulator.generator import MultiSensorGenerator
-from simulator.encoder import encode_value
+from simulator.generator import SensorGenerator
+from simulator.encoder import encode_value, decode_value
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-class MeasurementScheduler:
-    """
-    Schedules measurement updates based on per-measurement rates.
-    """
-
-    def __init__(self, rates: RatesConfig, tick_seconds: float):
-        """
-        Initialize the scheduler.
-
-        Args:
-            rates: Per-measurement rate configuration.
-            tick_seconds: Base tick interval in seconds.
-        """
-        self.rates = rates
-        self.tick_seconds = tick_seconds
-
-        # Track last update time for each measurement
-        self._last_update: Dict[str, float] = {}
-
-        # Initialize all measurements as needing update
-        for measurement in MEASUREMENT_TYPES:
-            self._last_update[measurement] = -float("inf")
-
-    def get_rate(self, measurement: str) -> float:
-        """Get the rate in seconds for a measurement."""
-        return getattr(self.rates, measurement, 1.0)
-
-    def get_due_measurements(self, current_time: float) -> Set[str]:
-        """
-        Get measurements that are due for update.
-
-        Args:
-            current_time: Current simulation time in seconds.
-
-        Returns:
-            Set of measurement names that should be updated.
-        """
-        due = set()
-
-        for measurement in MEASUREMENT_TYPES:
-            rate = self.get_rate(measurement)
-            last_update = self._last_update.get(measurement, -float("inf"))
-
-            if (current_time - last_update) >= rate:
-                due.add(measurement)
-
-        return due
-
-    def mark_updated(self, measurements: Set[str], current_time: float):
-        """
-        Mark measurements as updated at the given time.
-
-        Args:
-            measurements: Set of measurement names that were updated.
-            current_time: Time at which they were updated.
-        """
-        for measurement in measurements:
-            self._last_update[measurement] = current_time
-
-
 class SensorSimulator:
     """
-    Orchestrates the simulation of multiple sensors with multi-rate updates.
+    Orchestrates the simulation of multiple sensors.
+
+    Each sensor has its own generator and per-measurement update rate scheduling.
     """
 
-    def __init__(
-        self,
-        config: AppConfig,
-        modbus_client: ModbusClient,
-    ):
-        """
-        Initialize the simulator.
-
-        Args:
-            config: Application configuration.
-            modbus_client: Modbus client for writing registers.
-        """
+    def __init__(self, config: AppConfig, modbus_client: ModbusClient):
         self.config = config
         self.modbus_client = modbus_client
-
-        # Create generators for each sensor
-        self.multi_generator = MultiSensorGenerator()
-        for sensor_config in config.sensors:
-            self.multi_generator.add_sensor(sensor_config.id)
-
-        # Create scheduler
-        self.scheduler = MeasurementScheduler(
-            rates=config.update.rates,
-            tick_seconds=config.update.tick_seconds,
-        )
-
-        # Store sensor configs by ID for easy lookup
-        self._sensor_configs: Dict[str, SensorConfig] = {
-            s.id: s for s in config.sensors
-        }
-
-        # Track current values for each sensor
-        self._current_values: Dict[str, Dict[str, float]] = {}
-
-        # Running state
         self._running = False
-        self._start_time: float = 0.0
+        self._start_time = 0.0
+
+        # Create a generator per sensor
+        self._generators: Dict[str, SensorGenerator] = {}
+        # Track last update time: sensor_id -> measurement_name -> time
+        self._last_update: Dict[str, Dict[str, float]] = {}
+
+        for sensor in config.sensors:
+            self._generators[sensor.id] = SensorGenerator(
+                sensor.id, sensor.measurements
+            )
+            self._last_update[sensor.id] = {
+                m.name: -float("inf") for m in sensor.measurements
+            }
 
     def start(self):
         """Start the simulation loop."""
@@ -122,10 +45,9 @@ class SensorSimulator:
         self._start_time = time.time()
 
         logger.info("Starting sensor simulation")
-        logger.info(f"Tick interval: {self.config.update.tick_seconds}s")
-        logger.info(f"Number of sensors: {len(self.config.sensors)}")
+        logger.info(f"Tick interval: {self.config.tick_seconds}s")
+        logger.info(f"Sensors: {len(self.config.sensors)}")
 
-        # Connect to Modbus server
         if not self.modbus_client.connect():
             logger.error("Failed to connect to Modbus server")
             return
@@ -145,129 +67,130 @@ class SensorSimulator:
 
     def _run_loop(self):
         """Main simulation loop."""
-        tick_interval = self.config.update.tick_seconds
+        tick = self.config.tick_seconds
         next_tick = time.time()
 
         while self._running:
-            current_time = time.time()
-
-            # Wait for next tick
-            if current_time < next_tick:
-                time.sleep(min(0.01, next_tick - current_time))
+            now = time.time()
+            if now < next_tick:
+                time.sleep(min(0.01, next_tick - now))
                 continue
 
-            # Calculate simulation time
-            sim_time = current_time - self._start_time
+            sim_time = now - self._start_time
 
-            # Determine which measurements need updating
-            due_measurements = self.scheduler.get_due_measurements(sim_time)
+            for sensor in self.config.sensors:
+                self._update_sensor(sensor, sim_time)
 
-            if due_measurements:
-                # Process each sensor
-                for sensor_config in self.config.sensors:
-                    self._update_sensor(sensor_config, sim_time, due_measurements)
+            next_tick += tick
+            if next_tick < now:
+                next_tick = now + tick
 
-                # Mark measurements as updated
-                self.scheduler.mark_updated(due_measurements, sim_time)
+    def _update_sensor(self, sensor: SensorConfig, sim_time: float):
+        """Update due measurements for a sensor and write to Modbus."""
+        generator = self._generators[sensor.id]
+        last_updates = self._last_update[sensor.id]
 
-            # Schedule next tick
-            next_tick += tick_interval
+        # Collect registers to write (address -> list of uint16 values)
+        register_map: Dict[int, int] = {}
+        updates: List[dict] = []
 
-            # If we've fallen behind, catch up
-            if next_tick < current_time:
-                next_tick = current_time + tick_interval
+        for measurement in sensor.measurements:
+            last = last_updates[measurement.name]
+            if (sim_time - last) < measurement.update_rate:
+                continue
 
-    def _update_sensor(
-        self,
-        sensor_config: SensorConfig,
-        sim_time: float,
-        measurements: Set[str],
-    ):
-        """
-        Update measurements for a single sensor.
+            # Generate raw value
+            raw = generator.generate(measurement.name, sim_time)
 
-        Args:
-            sensor_config: Sensor configuration.
-            sim_time: Current simulation time.
-            measurements: Set of measurements to update.
-        """
-        sensor_id = sensor_config.id
-        generator = self.multi_generator.get_generator(sensor_id)
+            # Encode to register(s)
+            regs = encode_value(
+                raw,
+                measurement.data_type,
+                measurement.scale,
+                measurement.min_value,
+                measurement.max_value,
+                sensor.byte_order,
+                sensor.word_order,
+            )
 
-        if generator is None:
-            logger.error(f"No generator for sensor {sensor_id}")
+            # Round-trip decode to verify endianness
+            roundtrip = decode_value(
+                regs, measurement.data_type, scale=1.0,
+                byte_order=sensor.byte_order, word_order=sensor.word_order,
+            )
+
+            # Map to absolute addresses
+            base_addr = sensor.base_address + measurement.offset
+            for i, val in enumerate(regs):
+                register_map[base_addr + i] = val
+
+            regs_hex = "".join(f"{r:04x}" for r in regs)
+            updates.append({
+                "name": measurement.name,
+                "raw": raw,
+                "scaled": raw * measurement.scale,
+                "data_type": measurement.data_type.value,
+                "regs": regs,
+                "hex": regs_hex,
+                "roundtrip": roundtrip,
+                "byte_order": sensor.byte_order,
+                "word_order": sensor.word_order,
+            })
+
+            last_updates[measurement.name] = sim_time
+
+        if not register_map:
             return
 
-        # Generate new values for due measurements
-        raw_values = {}
-        encoded_values = {}
-        registers_to_write = {}
+        # Write all registers in contiguous blocks
+        success = self.modbus_client.write_register_blocks(register_map)
 
-        for measurement in measurements:
-            raw_value = generator.generate_single(measurement, sim_time)
-            encoded_value = encode_value(measurement, raw_value)
-
-            raw_values[measurement] = raw_value
-            encoded_values[measurement] = encoded_value
-
-            # Get register address
-            address = sensor_config.get_register_address(measurement)
-            registers_to_write[address] = encoded_value
-
-        # Store current values
-        if sensor_id not in self._current_values:
-            self._current_values[sensor_id] = {}
-        self._current_values[sensor_id].update(raw_values)
-
-        # Write to Modbus in contiguous blocks
-        success = self.modbus_client.write_register_blocks(registers_to_write)
-
-        # Log the update
-        self._log_update(sensor_id, raw_values, encoded_values, registers_to_write, success)
+        # Log
+        self._log_update(sensor.id, updates, register_map, success)
 
     def _log_update(
         self,
         sensor_id: str,
-        raw_values: Dict[str, float],
-        encoded_values: Dict[str, int],
+        updates: List[dict],
         registers: Dict[int, int],
         success: bool,
     ):
-        """Log measurement update."""
-        # Format raw values
-        raw_str = ", ".join(
-            f"{k}={v:.2f}" for k, v in sorted(raw_values.items())
-        )
-
-        # Format encoded values
-        encoded_str = ", ".join(
-            f"{k}={v}" for k, v in sorted(encoded_values.items())
-        )
-
-        # Group registers into blocks for logging
+        status = "OK" if success else "FAILED"
         blocks = self._get_register_blocks(registers)
         blocks_str = ", ".join(
-            f"[{start}:{start + count - 1}]" if count > 1 else f"[{start}]"
-            for start, count in blocks
+            f"[{s}:{s + c - 1}]" if c > 1 else f"[{s}]"
+            for s, c in blocks
         )
+        logger.info(f"[{sensor_id}] {status} | blocks: {blocks_str}")
+        for u in updates:
+            dt = u["data_type"]
+            is_float = dt in ("float32", "float64")
+            if is_float:
+                scaled_str = f"{u['scaled']:.6f}"
+                rt_str = f"{u['roundtrip']:.6f}"
+            else:
+                scaled_str = f"{u['scaled']:.2f}"
+                rt_str = f"{u['roundtrip']}"
+            logger.info(
+                f"[{sensor_id}]   {u['name']}: "
+                f"raw={u['raw']:.4f}, "
+                f"type={dt}, "
+                f"scaled={scaled_str}, "
+                f"regs={u['regs']}, "
+                f"hex={u['hex']}, "
+                f"roundtrip={rt_str}, "
+                f"endian=byte:{u['byte_order']}/word:{u['word_order']}"
+            )
 
-        status = "OK" if success else "FAILED"
-
-        logger.info(
-            f"[{sensor_id}] {status} | "
-            f"raw: {raw_str} | "
-            f"scaled: {encoded_str} | "
-            f"blocks: {blocks_str}"
-        )
-
-    def _get_register_blocks(self, registers: Dict[int, int]) -> List[Tuple[int, int]]:
-        """Get contiguous blocks as (start, count) tuples."""
+    def _get_register_blocks(
+        self, registers: Dict[int, int]
+    ) -> List[Tuple[int, int]]:
+        """Group register addresses into contiguous (start, count) blocks."""
         if not registers:
             return []
 
         sorted_addrs = sorted(registers.keys())
         blocks = []
-
         start = sorted_addrs[0]
         count = 1
 
@@ -284,16 +207,7 @@ class SensorSimulator:
 
 
 def run_simulation(config: AppConfig):
-    """
-    Run the sensor simulation.
-
-    Args:
-        config: Application configuration.
-    """
-    # Create Modbus client
+    """Run the sensor simulation."""
     modbus_client = ModbusClient(config.modbus)
-
-    # Create and start simulator
     simulator = SensorSimulator(config, modbus_client)
     simulator.start()
-
