@@ -32,10 +32,24 @@ class MeasurementTemplate(BaseModel):
 
 CATALOG: List[MeasurementTemplate] = [
     MeasurementTemplate(
-        name="temperature", label="Temperatura", unit="°C",
+        name="temperature", label="Temperatura (INT16, scale 10)", unit="°C",
         data_type=DataType.INT16, scale=10.0,
         min_value=-40.0, max_value=80.0, update_rate=1.0,
-        description="Sinusoide ~24°C ±2°C, rumore ±0.1°C",
+        description="INT16 con scale 10 → risoluzione 0.1°C. Sinusoide ~24°C ±2°C.",
+        generator="temperature",
+    ),
+    MeasurementTemplate(
+        name="temperature_int", label="Temperatura (INT16 as-is)", unit="°C",
+        data_type=DataType.INT16, scale=1.0,
+        min_value=-40.0, max_value=80.0, update_rate=1.0,
+        description="INT16 senza scale → risoluzione 1°C, valore intero. Tipico di termostati semplici.",
+        generator="temperature",
+    ),
+    MeasurementTemplate(
+        name="temperature_float", label="Temperatura (FLOAT32)", unit="°C",
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=-40.0, max_value=80.0, update_rate=1.0,
+        description="FLOAT32 nativo, nessuno scale → decimali pieni. Tipico di sensori moderni di fascia alta.",
         generator="temperature",
     ),
     MeasurementTemplate(
@@ -176,6 +190,25 @@ CATALOG: List[MeasurementTemplate] = [
         scale=1.0, min_value=0.0, max_value=4_294_967_295.0, update_rate=1.0,
         description="Contatore uptime device (input register, R/O)",
         generator="generic",
+    ),
+    # ---------------------------------------------------------------
+    # Boolean su registri 16-bit (HR / IR): 0 = false, 1 = true.
+    # Le convenzioni 0xFF00/0x0000 e bitmask si configurano manualmente
+    # cambiando min_value / max_value sul template di base.
+    # ---------------------------------------------------------------
+    MeasurementTemplate(
+        name="bool_flag_hr", label="Flag bool (HR, R/W)", unit="",
+        register_type=RegisterType.HOLDING_REGISTER, data_type=DataType.UINT16,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=2.0,
+        description="Flag booleano su holding register R/W. UINT16 con valori 0/1.",
+        generator="boolean_periodic",
+    ),
+    MeasurementTemplate(
+        name="bool_flag_ir", label="Flag bool (IR, R/O)", unit="",
+        register_type=RegisterType.INPUT_REGISTER, data_type=DataType.UINT16,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=2.0,
+        description="Flag booleano su input register R/O. UINT16 con valori 0/1.",
+        generator="boolean_periodic",
     ),
 ]
 

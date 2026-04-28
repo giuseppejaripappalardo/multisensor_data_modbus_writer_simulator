@@ -72,6 +72,9 @@ class SensorGenerator:
             "motor_run": self._gen_boolean_periodic,
             "presence": self._gen_boolean_periodic,
             "limit_switch": self._gen_boolean_periodic,
+            # Boolean su registri 16-bit (UINT16 con valori 0/1)
+            "bool_flag_hr": self._gen_boolean_periodic,
+            "bool_flag_ir": self._gen_boolean_periodic,
             # Counters
             "uptime_seconds": self._gen_uptime,
         }

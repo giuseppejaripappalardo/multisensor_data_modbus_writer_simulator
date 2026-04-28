@@ -53,20 +53,26 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Modbus: {config.modbus.host}:{config.modbus.port} (unit {config.modbus.unit_id})")
     logger.info(f"Tick: {config.tick_seconds}s")
-    logger.info(f"Sensors: {len(config.sensors)}")
+    total_sensors = sum(len(s.sensors) for s in config.servers)
+    logger.info(f"Servers: {len(config.servers)} (total sensors: {total_sensors})")
 
-    for sensor in config.sensors:
+    for server in config.servers:
         logger.info(
-            f"  [{sensor.id}] base={sensor.base_address}, "
-            f"endian={sensor.byte_order}/{sensor.word_order}, "
-            f"measurements={len(sensor.measurements)}"
+            f"  Server [{server.id}] {server.host}:{server.port}, "
+            f"default_unit={server.default_unit_id}, sensors={len(server.sensors)}"
         )
-        for m in sensor.measurements:
+        for sensor in server.sensors:
             logger.info(
-                f"    - {m.name}: offset={m.offset}, type={m.data_type.value}, "
-                f"scale={m.scale}, range=[{m.min_value}, {m.max_value}], "
-                f"rate={m.update_rate}s, regs={m.register_count}"
+                f"    [{sensor.id}] unit={sensor.unit_id}, base={sensor.base_address}, "
+                f"endian={sensor.byte_order}/{sensor.word_order}, "
+                f"measurements={len(sensor.measurements)}"
             )
+            for m in sensor.measurements:
+                logger.info(
+                    f"      - {m.name}: offset={m.offset}, type={m.data_type.value}, "
+                    f"scale={m.scale}, range=[{m.min_value}, {m.max_value}], "
+                    f"rate={m.update_rate}s, regs={m.register_count}"
+                )
 
     logger.info("=" * 60)
     logger.info("Press Ctrl+C to stop")

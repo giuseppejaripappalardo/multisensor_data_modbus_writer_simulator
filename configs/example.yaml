@@ -1,183 +1,144 @@
-# ============================================================================
-# Multisensor Modbus Simulator - Esempio di configurazione
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Multisensor Modbus Simulator — esempio multi-server.
 #
-# Questo file mostra l'INTERO schema supportato dal simulatore.
-# Tutti i campi (tranne i sensori e le misure) sono opzionali — i default sono
-# applicati dai modelli Pydantic.
+# Schema:
+#   modbus:           configurazione del client Modbus usato dal CLI legacy
+#                     (python main.py). Non influisce sul web UI / embedded.
+#   tick_seconds:     cadenza globale del simulatore.
+#   log_level:        DEBUG | INFO | WARNING | ERROR
+#   servers:          lista di server Modbus TCP indipendenti.
+#                     - ogni server ha (host, port) unico
+#                     - dentro ogni server, sensori con unit_id diversi
+#                       sono esposti come slave indipendenti (gateway-style)
+#                     - sensor id può ripetersi tra server diversi
 #
-# Modalità di esecuzione
-# ----------------------
-# Esistono due modalità:
-#
-#   1. Server EMBEDDED (default per `python -m webui` e per Docker):
-#      - il simulatore avvia un Modbus TCP server in-process e ci scrive sopra
-#      - usa la sezione `server:`
-#      - può ospitare più slave (uno per ciascun `unit_id` usato dai sensori)
-#
-#   2. CLIENT verso un server Modbus esterno (modalità legacy `python main.py`):
-#      - il simulatore si connette a un server Modbus esistente e scrive
-#      - usa la sezione `modbus:`
-#      - tutti i sensori vengono scritti con `modbus.unit_id`
-#
-# Tipi di dato (Modbus holding registers)
-# ---------------------------------------
-#   uint16    -> 1 registro    (0 .. 65535)
-#   int16     -> 1 registro    (-32768 .. 32767)
-#   uint32    -> 2 registri    (0 .. 4294967295)
-#   int32     -> 2 registri    (-2147483648 .. 2147483647)
-#   float32   -> 2 registri    (IEEE 754 single precision)
-#   float64   -> 4 registri    (IEEE 754 double precision)
-#
-# Endianness (per sensore)
-# ------------------------
-#   byte_order  : "big" | "little"   (ordine byte dentro a ogni registro 16-bit)
-#   word_order  : "big" | "little"   (ordine registri per tipi multi-registro)
-#
-#   big/big       = AB CD   (Big Endian, standard Modbus)
-#   big/little    = CD AB   (word swap)
-#   little/big    = BA DC   (byte swap)
-#   little/little = DC BA   (Little Endian)
-#
-# Misure note (presenti nel catalogo, generatori realistici)
-# ---------------------------------------------------------
-#   temperature, humidity, co2, tvoc, pm25, pm10, lux, noise,
-#   pressure, voltage, current, power, energy, frequency, custom
-# ============================================================================
+# Schema legacy (`server: {...}` + `sensors: [...]` flat) ancora supportato:
+# viene migrato automaticamente al primo load in un singolo server "default".
+# ---------------------------------------------------------------------------
 
-# -- Server Modbus TCP integrato (modalità embedded) --
-server:
-  enabled: true
-  host: "0.0.0.0"
-  port: 502
-  default_unit_id: 1     # unit_id pre-compilato quando crei un sensore dalla UI
-  register_count_min: 16 # ogni slave alloca almeno questo numero di registri
-
-# -- Client Modbus TCP (modalità legacy verso server esterno) --
 modbus:
-  host: "127.0.0.1"
-  port: 502
+  host: 127.0.0.1
+  port: 5020
   unit_id: 1
   connect_timeout_ms: 3000
   write_timeout_ms: 1000
   max_retry_attempts: 3
   backoff_seconds: [1.0, 2.0, 5.0]
 
-# -- Loop principale --
 tick_seconds: 1.0
+log_level: INFO
 
-# -- Logging --
-log_level: "INFO"
+servers:
+  # -------------------------------------------------------------------------
+  # Server 1: simula un piano "office" con due slave dietro un gateway.
+  #   - slave 1 = unità ambiente (temperatura + umidità)
+  #   - slave 2 = unità qualità aria (CO2 + TVOC + PM)
+  # -------------------------------------------------------------------------
+  - id: plant_a
+    label: Plant A — uffici
+    description: Gateway ambientale piano uffici
+    host: 0.0.0.0
+    port: 5020
+    default_unit_id: 1
+    register_count_min: 16
+    auto_start: false
+    sensors:
+      - id: env_room
+        unit_id: 1
+        base_address: 0
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 1.0
+        measurements:
+          - name: temperature
+            offset: 0
+            register_type: holding_register
+            data_type: int16
+            scale: 10.0
+            min_value: -40.0
+            max_value: 80.0
+            update_rate: 1.0
+            unit: °C
+          - name: humidity
+            offset: 1
+            register_type: holding_register
+            data_type: uint16
+            scale: 10.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 1.0
+            unit: "%"
+      - id: air_quality
+        unit_id: 2
+        base_address: 0
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 5.0
+        measurements:
+          - name: co2
+            offset: 0
+            data_type: uint16
+            scale: 1.0
+            min_value: 400.0
+            max_value: 5000.0
+            update_rate: 5.0
+            unit: ppm
+          - name: tvoc
+            offset: 1
+            data_type: uint16
+            scale: 1.0
+            min_value: 0.0
+            max_value: 5000.0
+            update_rate: 5.0
+            unit: ppb
+          - name: pm25
+            offset: 2
+            data_type: uint16
+            scale: 1.0
+            min_value: 0.0
+            max_value: 500.0
+            update_rate: 10.0
+            unit: µg/m³
 
-# -- Sensori --
-sensors:
-
-  # -------------------------------------------------------------------
-  # Sensore 1: ambiente ufficio sullo SLAVE 1 (uint16 / int16, big-endian)
-  # -------------------------------------------------------------------
-  - id: "office"
-    unit_id: 1                  # slave Modbus esposto dal server embedded
-    base_address: 0
-    byte_order: "big"
-    word_order: "big"
-    write_rate_seconds: 1.0     # rate-limit minimo per le scritture di questo sensore
-    measurements:
-      - name: "temperature"
-        offset: 0
-        data_type: "int16"
-        scale: 10               # 25.3°C -> 253
-        min_value: -40.0
-        max_value: 80.0
-        update_rate: 1.0
-        unit: "°C"
-      - name: "humidity"
-        offset: 1
-        data_type: "uint16"
-        scale: 10               # 55.2% -> 552
-        min_value: 0.0
-        max_value: 100.0
-        update_rate: 1.0
-        unit: "%"
-      - name: "co2"
-        offset: 2
-        data_type: "uint16"
-        scale: 1
-        min_value: 400.0
-        max_value: 5000.0
-        update_rate: 5.0
-        unit: "ppm"
-
-  # -------------------------------------------------------------------
-  # Sensore 2: stazione meteo float32 sullo SLAVE 2 (gateway-style multi-slave)
-  # Ogni misura occupa 2 registri -> offset incrementano di 2.
-  # -------------------------------------------------------------------
-  - id: "weather_station"
-    unit_id: 2
-    base_address: 0
-    byte_order: "big"
-    word_order: "big"
-    write_rate_seconds: 1.0
-    measurements:
-      - name: "temperature"
-        offset: 0
-        data_type: "float32"
-        scale: 1.0
-        min_value: -40.0
-        max_value: 80.0
-        update_rate: 1.0
-        unit: "°C"
-      - name: "humidity"
-        offset: 2
-        data_type: "float32"
-        scale: 1.0
-        min_value: 0.0
-        max_value: 100.0
-        update_rate: 1.0
-        unit: "%"
-      - name: "lux"
-        offset: 4
-        data_type: "float32"
-        scale: 1.0
-        min_value: 0.0
-        max_value: 100000.0
-        update_rate: 2.0
-        unit: "lux"
-
-  # -------------------------------------------------------------------
-  # Sensore 3 (commentato): contatore energia con FAULT INJECTION
-  # word_order=little (CD AB) tipico di Eastron / ABB.
-  # Mostra l'uso completo dei guasti per sensore e per misura.
-  # -------------------------------------------------------------------
-  # - id: "energy_meter"
-  #   unit_id: 3
-  #   base_address: 0
-  #   byte_order: "big"
-  #   word_order: "little"
-  #   write_rate_seconds: 60.0      # scrivi al massimo una volta al minuto
-  #   fault:
-  #     latency_ms: 250             # 250ms di latenza su ogni read
-  #     offline: false              # true -> tutto il sensore irraggiungibile
-  #     error_rate: 0.0             # probabilità di GATEWAY TARGET DEVICE FAILED
-  #     error_code: 11
-  #   measurements:
-  #     - name: "power"
-  #       offset: 0
-  #       data_type: "float32"
-  #       scale: 1.0
-  #       min_value: 0.0
-  #       max_value: 50000.0
-  #       update_rate: 1.0
-  #       unit: "W"
-  #       fault:
-  #         error_rate: 0.05        # 5% probabilità di ILLEGAL DATA ADDRESS sul read
-  #         error_code: 2
-  #         frozen: false           # se true: il valore non viene più aggiornato
-  #         drop_writes: false      # se true: il simulatore NON scrive il registro
-  #     - name: "energy"
-  #       offset: 2
-  #       data_type: "float64"      # 4 registri
-  #       scale: 1.0
-  #       min_value: 0.0
-  #       max_value: 999999999.0
-  #       update_rate: 5.0
-  #       unit: "kWh"
+  # -------------------------------------------------------------------------
+  # Server 2: simula un quadro elettrico in un magazzino su porta diversa.
+  # Sensor id liberi di ripetersi tra server (es. "power_meter") senza conflitto.
+  # -------------------------------------------------------------------------
+  - id: plant_b
+    label: Plant B — magazzino
+    host: 0.0.0.0
+    port: 5021
+    default_unit_id: 1
+    auto_start: false
+    sensors:
+      - id: power_meter
+        unit_id: 1
+        base_address: 100
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 1.0
+        measurements:
+          - name: voltage
+            offset: 0
+            data_type: float32
+            scale: 1.0
+            min_value: 200.0
+            max_value: 250.0
+            update_rate: 1.0
+            unit: V
+          - name: current
+            offset: 2
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 1.0
+            unit: A
+          - name: power
+            offset: 4
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 50000.0
+            update_rate: 1.0
+            unit: W

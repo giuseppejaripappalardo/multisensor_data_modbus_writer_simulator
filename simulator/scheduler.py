@@ -14,7 +14,14 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
-from models import AppConfig, MeasurementConfig, RegisterType, SensorConfig, is_bit_space
+from models import (
+    AppConfig,
+    MeasurementConfig,
+    RegisterType,
+    SensorConfig,
+    ServerConfig,
+    is_bit_space,
+)
 from simulator.encoder import decode_value, encode_value
 from simulator.generator import SensorGenerator
 from utils.clamp import clamp
@@ -123,11 +130,13 @@ class SensorSimulator:
 
     def __init__(
         self,
-        config: AppConfig,
+        server_config: ServerConfig,
         sink: RegisterSink,
+        tick_seconds: float = 1.0,
         on_update: Optional[Callable[[str, List[dict]], None]] = None,
     ):
-        self.config = config
+        self.server_config = server_config
+        self.tick_seconds = tick_seconds
         self.sink = sink
         self.on_update = on_update
 
@@ -194,9 +203,13 @@ class SensorSimulator:
 
     # --- live config update -----------------------------------------
 
-    def reload_config(self, config: AppConfig) -> None:
+    def reload_config(
+        self, server_config: ServerConfig, tick_seconds: Optional[float] = None,
+    ) -> None:
         """Replace the active configuration without restarting the loop."""
-        self.config = config
+        self.server_config = server_config
+        if tick_seconds is not None:
+            self.tick_seconds = tick_seconds
         self._reset_state()
 
     def _reset_state(self) -> None:
@@ -204,7 +217,7 @@ class SensorSimulator:
         last: Dict[str, Dict[str, float]] = {}
         frozen: Dict[str, Dict[str, float]] = {}
         drift: Dict[str, Dict[str, float]] = {}
-        for sensor in self.config.sensors:
+        for sensor in self.server_config.sensors:
             gens[sensor.id] = SensorGenerator(sensor.id, sensor.measurements)
             last[sensor.id] = {m.name: -float("inf") for m in sensor.measurements}
             frozen[sensor.id] = {}
@@ -247,7 +260,7 @@ class SensorSimulator:
 
     def _run_loop(self) -> None:
         try:
-            tick = max(0.05, self.config.tick_seconds)
+            tick = max(0.05, self.tick_seconds)
             next_tick = time.time()
             while not self._stop_event.is_set():
                 now = time.time()
@@ -255,7 +268,7 @@ class SensorSimulator:
                     self._stop_event.wait(min(0.05, next_tick - now))
                     continue
                 sim_time = now - self._start_time
-                for sensor in self.config.sensors:
+                for sensor in self.server_config.sensors:
                     if self._stop_event.is_set():
                         break
                     self._update_sensor(sensor, sim_time)
@@ -398,12 +411,26 @@ class SensorSimulator:
 
 
 def run_simulation(config: AppConfig) -> None:
-    """Blocking entry point used by the CLI. Writes to a remote Modbus TCP slave."""
+    """
+    Blocking entry point used by the CLI. Writes to a single remote Modbus
+    TCP slave (config.modbus). All sensors across all servers are flattened
+    into one synthetic ServerConfig, since the CLI mode targets one external
+    slave regardless of the embedded multi-server topology.
+    """
     from modbus_client import ModbusClient
 
     client = ModbusClient(config.modbus)
     sink = ModbusClientSink(client)
-    sim = SensorSimulator(config, sink)
+
+    all_sensors: List[SensorConfig] = [
+        sensor for server in config.servers for sensor in server.sensors
+    ]
+    synthetic = ServerConfig(
+        id="cli", label="CLI flattened",
+        host=config.modbus.host, port=config.modbus.port,
+        sensors=all_sensors,
+    )
+    sim = SensorSimulator(synthetic, sink, tick_seconds=config.tick_seconds)
     if not sim.start():
         return
     try:

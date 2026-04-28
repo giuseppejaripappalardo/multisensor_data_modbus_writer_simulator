@@ -12,20 +12,14 @@
     <header>
       <div class="brand">
         <h1>Multisensor Modbus Simulator</h1>
-        <small>Plug-and-play sensor → measurements → Modbus TCP</small>
+        <small>Server multipli · sensori annidati · Modbus TCP gateway-style</small>
       </div>
       <div class="controls">
-        <div class="status-pill" :class="{ on: status.server.running }">
-          Server <span x-text="status.server.host + ':' + status.server.port"></span>
-          <small class="hint" x-show="status.server.slaves && status.server.slaves.length"
-                 x-text="' · ' + status.server.slaves.map(s => 'u' + s.unit_id).join(', ')"></small>
-          <strong x-text="status.server.running ? 'ON' : 'OFF'"></strong>
+        <div class="status-pill" :class="{ on: anyServerRunning() }">
+          Servers attivi <strong x-text="runningServerCount() + '/' + (config.servers?.length || 0)"></strong>
         </div>
-        <button class="btn primary" @click="toggleServer()" x-text="status.server.running ? 'Ferma server' : 'Avvia server'"></button>
-        <div class="status-pill" :class="{ on: status.simulator.running }">
-          Simulatore <strong x-text="status.simulator.running ? 'ON' : 'OFF'"></strong>
-        </div>
-        <button class="btn primary" @click="toggleSimulator()" x-text="status.simulator.running ? 'Ferma simulatore' : 'Avvia simulatore'"></button>
+        <button class="btn" @click="startAll()" :disabled="(config.servers?.length || 0) === 0">Avvia tutti</button>
+        <button class="btn danger" @click="stopAll()" :disabled="!anyServerRunning()">Ferma tutti</button>
       </div>
     </header>
 
@@ -33,7 +27,15 @@
       <!-- LEFT: Catalog -->
       <aside class="catalog">
         <h2>Catalogo misure</h2>
-        <p class="hint">Trascina o seleziona un sensore poi clicca <em>+</em>.</p>
+        <p class="hint">
+          Seleziona un sensore (clicca sull'header) e poi
+          aggiungi una misura dal catalogo.
+        </p>
+        <p class="hint" x-show="selectedTarget.sensorId">
+          Target:
+          <strong x-text="selectedTarget.serverId"></strong> /
+          <strong x-text="selectedTarget.sensorId"></strong>
+        </p>
         <ul>
           <template x-for="t in catalog" :key="t.name">
             <li class="cat-item">
@@ -42,291 +44,511 @@
                 <span class="badge" x-text="t.data_type"></span>
               </div>
               <div class="cat-meta">
-                <span x-text="t.unit"></span> · scale <span x-text="t.scale"></span> · <span x-text="t.register_count"></span> reg
+                <span x-text="t.unit || '—'"></span> · scale <span x-text="t.scale"></span> · <span x-text="t.register_count"></span> reg
               </div>
               <small x-text="t.description"></small>
-              <button class="btn small" :disabled="!selectedSensorId" @click="addMeasurementFromTemplate(t)">+ Aggiungi al sensore selezionato</button>
+              <button class="btn small"
+                      :disabled="!selectedTarget.sensorId || isLocked(selectedTarget.serverId)"
+                      @click="addMeasurementFromTemplate(t)">
+                + Aggiungi al sensore selezionato
+              </button>
             </li>
           </template>
         </ul>
       </aside>
 
-      <!-- CENTER: Sensors -->
-      <section class="sensors">
-        <div class="section-head">
-          <h2>Sensori</h2>
-          <div class="add-form">
-            <input x-model="newSensor.id" placeholder="ID (es. office_aq)" />
-            <input x-model.number="newSensor.unit_id" type="number" min="0" max="247"
-                   title="Modbus slave / unit id" placeholder="Unit ID" />
-            <input x-model.number="newSensor.base_address" type="number" min="0" placeholder="Base addr" />
-            <select x-model="newSensor.byte_order">
-              <option value="big">byte=BIG</option>
-              <option value="little">byte=LITTLE</option>
-            </select>
-            <select x-model="newSensor.word_order">
-              <option value="big">word=BIG</option>
-              <option value="little">word=LITTLE</option>
-            </select>
-            <input x-model.number="newSensor.write_rate_seconds" type="number" min="0.1" step="0.5"
-                   title="Frequenza minima di write Modbus (secondi)" placeholder="Write rate s" />
-            <button class="btn primary" @click="createSensor()">+ Sensore</button>
+      <!-- RIGHT: Servers area -->
+      <section class="servers">
+        <!-- Create server form -->
+        <article class="card create-server">
+          <header class="card-head">
+            <h2>Crea un nuovo server</h2>
+            <small class="hint">Ogni server è un listener Modbus TCP indipendente (host:porta unici).</small>
+          </header>
+          <div class="card-body">
+            <div class="form-grid">
+              <label class="form-field">
+                <span>ID server <em>*</em></span>
+                <input x-model="newServer.id"
+                       placeholder="plant_a"
+                       title="Identificatore univoco (lettere, cifre, _ e -). Usato negli URL." />
+              </label>
+              <label class="form-field">
+                <span>Etichetta</span>
+                <input x-model="newServer.label"
+                       placeholder="Plant A — main floor"
+                       title="Nome visualizzato. Solo cosmetico." />
+              </label>
+              <label class="form-field">
+                <span>Host</span>
+                <input x-model="newServer.host"
+                       placeholder="0.0.0.0"
+                       title="Interfaccia di bind. 0.0.0.0 = tutte. 127.0.0.1 = solo locale." />
+              </label>
+              <label class="form-field">
+                <span>Porta TCP <em>*</em></span>
+                <input type="number" min="1" max="65535"
+                       x-model.number="newServer.port"
+                       title="Porta TCP. Su Linux <1024 richiede privilegi root. Suggerimento: 5020+." />
+              </label>
+              <label class="form-field">
+                <span>Default unit ID</span>
+                <input type="number" min="0" max="247"
+                       x-model.number="newServer.default_unit_id"
+                       title="Unit ID precompilato per i nuovi sensori in questo server." />
+              </label>
+              <label class="form-field">
+                <span>Min. registri</span>
+                <input type="number" min="1"
+                       x-model.number="newServer.register_count_min"
+                       title="Numero minimo di registri allocati per (unit_id, register_type). I sensori espandono automaticamente lo spazio." />
+              </label>
+              <label class="form-field check-field" title="Avvia automaticamente questo server quando l'app parte.">
+                <input type="checkbox" x-model="newServer.auto_start" />
+                <span>Auto-start al boot</span>
+              </label>
+              <div class="form-field actions">
+                <button class="btn primary" @click="createServer()">+ Crea server</button>
+              </div>
+            </div>
           </div>
-        </div>
+        </article>
 
-        <template x-if="config.sensors.length === 0">
-          <div class="empty">Nessun sensore. Crea il primo qui sopra.</div>
+        <!-- Empty state -->
+        <template x-if="(config.servers?.length || 0) === 0">
+          <div class="empty">Nessun server configurato. Creane uno qui sopra.</div>
         </template>
 
-        <template x-for="s in config.sensors" :key="s.id">
-          <article class="sensor" :class="{ selected: s.id === selectedSensorId }">
-            <header @click="selectedSensorId = s.id">
-              <div>
-                <h3 x-text="s.id"></h3>
+        <!-- Server cards -->
+        <template x-for="srv in config.servers" :key="srv.id">
+          <article class="card server-card" :class="{ running: serverStatus(srv.id).running }">
+            <header class="card-head server-head">
+              <div class="server-title">
+                <h2>
+                  <span x-text="srv.label || srv.id"></span>
+                  <code class="srv-id" x-text="srv.id"></code>
+                </h2>
                 <small>
-                  unit <strong x-text="s.unit_id"></strong> ·
-                  base <strong x-text="s.base_address"></strong> ·
-                  byte=<span x-text="s.byte_order"></span> ·
-                  word=<span x-text="s.word_order"></span> ·
-                  write <strong x-text="s.write_rate_seconds + 's'"></strong> ·
-                  <span x-text="s.measurements.length"></span> misure
+                  <strong x-text="srv.host + ':' + srv.port"></strong>
+                  · default unit <span x-text="srv.default_unit_id"></span>
+                  · <span x-text="srv.sensors.length"></span> sensori
+                  ·
+                  <span class="state-pill"
+                        :class="{ on: serverStatus(srv.id).running }">
+                    server <strong x-text="serverStatus(srv.id).running ? 'ON' : 'OFF'"></strong>
+                  </span>
+                  <span class="state-pill"
+                        :class="{ on: serverStatus(srv.id).simulator_running }">
+                    sim <strong x-text="serverStatus(srv.id).simulator_running ? 'ON' : 'OFF'"></strong>
+                  </span>
                 </small>
               </div>
-              <button class="btn danger small" @click.stop="deleteSensor(s.id)">elimina</button>
+              <div class="server-actions">
+                <button class="btn primary" @click="toggleServerLifecycle(srv.id)"
+                        x-text="serverStatus(srv.id).running ? 'Ferma server' : 'Avvia server'"></button>
+                <button class="btn" @click="toggleSimulator(srv.id)"
+                        x-text="serverStatus(srv.id).simulator_running ? 'Ferma sim' : 'Avvia sim'"></button>
+                <button class="btn" @click="kickServer(srv.id)"
+                        :disabled="!serverStatus(srv.id).running"
+                        title="Chiude tutte le connessioni TCP attive (test reconnect logic).">
+                  Kick
+                </button>
+                <button class="btn danger small"
+                        @click="deleteServer(srv.id)"
+                        :disabled="serverStatus(srv.id).running"
+                        title="Eliminazione consentita solo a server fermo.">
+                  Elimina
+                </button>
+              </div>
             </header>
 
-            <div class="sensor-body">
-              <div class="row two-col">
-                <label title="Modbus slave / unit id - sensori con unit id diversi sono isolati come dispositivi indipendenti dietro un gateway.">
-                  Unit ID
-                  <input type="number" min="0" max="247" :value="s.unit_id"
-                         @change="patchSensor(s.id, { unit_id: +$event.target.value })" />
+            <div class="card-body server-body" :class="{ locked: isLocked(srv.id) }">
+              <!-- Server config (structural fields locked when running) -->
+              <fieldset class="server-config">
+                <legend>Configurazione server</legend>
+                <label class="form-field" title="Modificabile solo a server fermo.">
+                  <span>Host</span>
+                  <input :value="srv.host"
+                         :disabled="isLocked(srv.id)"
+                         @change="patchServer(srv.id, { host: $event.target.value })" />
                 </label>
-                <label>
-                  Base address
-                  <input type="number" min="0" :value="s.base_address" @change="patchSensor(s.id, { base_address: +$event.target.value })" />
+                <label class="form-field" title="Modificabile solo a server fermo.">
+                  <span>Porta TCP</span>
+                  <input type="number" min="1" max="65535"
+                         :value="srv.port"
+                         :disabled="isLocked(srv.id)"
+                         @change="patchServer(srv.id, { port: +$event.target.value })" />
                 </label>
-                <label>
-                  Byte order
-                  <select :value="s.byte_order" @change="patchSensor(s.id, { byte_order: $event.target.value })">
-                    <option value="big">big</option>
-                    <option value="little">little</option>
-                  </select>
+                <label class="form-field" title="Modificabile solo a server fermo.">
+                  <span>Default unit ID</span>
+                  <input type="number" min="0" max="247"
+                         :value="srv.default_unit_id"
+                         :disabled="isLocked(srv.id)"
+                         @change="patchServer(srv.id, { default_unit_id: +$event.target.value })" />
                 </label>
-                <label>
-                  Word order
-                  <select :value="s.word_order" @change="patchSensor(s.id, { word_order: $event.target.value })">
-                    <option value="big">big</option>
-                    <option value="little">little</option>
-                  </select>
+                <label class="form-field" title="Modificabile solo a server fermo.">
+                  <span>Min. registri</span>
+                  <input type="number" min="1"
+                         :value="srv.register_count_min"
+                         :disabled="isLocked(srv.id)"
+                         @change="patchServer(srv.id, { register_count_min: +$event.target.value })" />
                 </label>
-                <label title="Frequenza di scrittura sul Modbus per questo sensore. Si applica al massimo tra questo e l'update_rate della singola misura.">
-                  Write rate (s)
-                  <input type="number" min="0.1" step="0.5" :value="s.write_rate_seconds"
-                         @change="patchSensor(s.id, { write_rate_seconds: +$event.target.value })" />
+                <label class="form-field" title="Sempre modificabile (cosmetico).">
+                  <span>Etichetta</span>
+                  <input :value="srv.label || ''"
+                         @change="patchServer(srv.id, { label: $event.target.value })" />
                 </label>
-              </div>
-
-              <fieldset class="fault">
-                <legend>Fault injection (sensore)</legend>
-                <label>
-                  Latenza ms
-                  <input type="number" min="0" step="10" :value="s.fault.latency_ms"
-                         @change="patchSensor(s.id, { fault: { ...s.fault, latency_ms: +$event.target.value } })" />
-                </label>
-                <label>
-                  Error rate (0..1)
-                  <input type="number" min="0" max="1" step="0.05" :value="s.fault.error_rate"
-                         @change="patchSensor(s.id, { fault: { ...s.fault, error_rate: +$event.target.value } })" />
-                </label>
-                <label class="check">
-                  <input type="checkbox" :checked="s.fault.offline"
-                         @change="patchSensor(s.id, { fault: { ...s.fault, offline: $event.target.checked } })" />
-                  Offline (slave non risponde)
+                <label class="form-field check-field" title="Sempre modificabile.">
+                  <input type="checkbox" :checked="srv.auto_start"
+                         @change="patchServer(srv.id, { auto_start: $event.target.checked })" />
+                  <span>Auto-start</span>
                 </label>
               </fieldset>
 
-              <h4>Misure</h4>
-              <template x-if="s.measurements.length === 0">
-                <p class="empty">Nessuna misura. Aggiungi dal catalogo a sinistra (sensore selezionato → clicca +).</p>
+              <!-- Create-sensor form (per server) -->
+              <div class="add-form-block">
+                <h3>Aggiungi sensore a <code x-text="srv.id"></code></h3>
+                <p class="hint" x-show="isLocked(srv.id)">
+                  Server in esecuzione: ferma il server per aggiungere o rimuovere sensori.
+                </p>
+                <div class="form-grid"
+                     x-data="{ d: newSensorByServer[srv.id] }"
+                     :class="{ disabled: isLocked(srv.id) }">
+                  <label class="form-field">
+                    <span>ID sensore <em>*</em></span>
+                    <input :disabled="isLocked(srv.id)"
+                           x-model="newSensorByServer[srv.id].id"
+                           placeholder="es. office_aq"
+                           title="Identificatore univoco entro questo server (può ripetersi tra server diversi)." />
+                  </label>
+                  <label class="form-field">
+                    <span>Unit ID (slave)</span>
+                    <input type="number" min="0" max="247"
+                           :disabled="isLocked(srv.id)"
+                           x-model.number="newSensorByServer[srv.id].unit_id"
+                           title="Modbus slave / unit id. Sensori con unit id diversi sullo stesso server sono dispositivi indipendenti dietro un gateway." />
+                  </label>
+                  <label class="form-field">
+                    <span>Indirizzo base</span>
+                    <input type="number" min="0"
+                           :disabled="isLocked(srv.id)"
+                           x-model.number="newSensorByServer[srv.id].base_address"
+                           title="Indirizzo del primo registro del sensore. Le misure usano offset relativi a questo." />
+                  </label>
+                  <label class="form-field">
+                    <span>Byte order</span>
+                    <select :disabled="isLocked(srv.id)"
+                            x-model="newSensorByServer[srv.id].byte_order"
+                            title="Ordine dei byte all'interno di ciascun registro a 16 bit. Modbus standard = big.">
+                      <option value="big">big (standard)</option>
+                      <option value="little">little</option>
+                    </select>
+                  </label>
+                  <label class="form-field">
+                    <span>Word order</span>
+                    <select :disabled="isLocked(srv.id)"
+                            x-model="newSensorByServer[srv.id].word_order"
+                            title="Ordine delle parole 16-bit nei valori a 32/64 bit. Modbus standard = big.">
+                      <option value="big">big (standard)</option>
+                      <option value="little">little</option>
+                    </select>
+                  </label>
+                  <label class="form-field">
+                    <span>Write rate (s)</span>
+                    <input type="number" min="0.1" step="0.5"
+                           :disabled="isLocked(srv.id)"
+                           x-model.number="newSensorByServer[srv.id].write_rate_seconds"
+                           title="Frequenza minima di scrittura sul Modbus per questo sensore. Vince il valore più alto tra questo e l'update_rate della singola misura." />
+                  </label>
+                  <div class="form-field actions">
+                    <button class="btn primary"
+                            :disabled="isLocked(srv.id)"
+                            @click="createSensor(srv.id)">
+                      + Sensore
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Sensor list -->
+              <template x-if="srv.sensors.length === 0">
+                <div class="empty">Nessun sensore in questo server.</div>
               </template>
-              <table x-show="s.measurements.length > 0">
-                <thead>
-                  <tr>
-                    <th>Nome</th>
-                    <th>Offset</th>
-                    <th title="Modbus address space">Spazio</th>
-                    <th>Tipo</th>
-                    <th>Scale</th>
-                    <th>Range</th>
-                    <th>Rate</th>
-                    <th>Fault</th>
-                    <th>Live</th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <template x-for="m in s.measurements" :key="m.name">
-                    <tr>
-                      <td><strong x-text="m.name"></strong><br /><small x-text="m.unit || ''"></small></td>
-                      <td>
-                        <input type="number" min="0" :value="m.offset"
-                               @change="patchMeasurement(s.id, m.name, { offset: +$event.target.value })" />
-                      </td>
-                      <td>
-                        <select :value="m.register_type"
-                                @change="patchMeasurement(s.id, m.name, { register_type: $event.target.value })">
-                          <template x-for="rt in registerTypes" :key="rt">
-                            <option :value="rt" x-text="rtLabel(rt)"></option>
-                          </template>
+
+              <template x-for="s in srv.sensors" :key="s.id">
+                <article class="sensor"
+                         :class="{ selected: isTargetSelected(srv.id, s.id) }">
+                  <header @click="selectTarget(srv.id, s.id)">
+                    <div>
+                      <h4 x-text="s.id"></h4>
+                      <small>
+                        unit <strong x-text="s.unit_id"></strong>
+                        · base <strong x-text="s.base_address"></strong>
+                        · byte=<span x-text="s.byte_order"></span>
+                        · word=<span x-text="s.word_order"></span>
+                        · write <strong x-text="s.write_rate_seconds + 's'"></strong>
+                        · <span x-text="s.measurements.length"></span> misure
+                      </small>
+                    </div>
+                    <button class="btn danger small"
+                            :disabled="isLocked(srv.id)"
+                            @click.stop="deleteSensor(srv.id, s.id)">
+                      elimina
+                    </button>
+                  </header>
+
+                  <div class="sensor-body">
+                    <div class="row two-col">
+                      <label title="Modificabile solo a server fermo.">
+                        Unit ID
+                        <input type="number" min="0" max="247"
+                               :value="s.unit_id"
+                               :disabled="isLocked(srv.id)"
+                               @change="patchSensor(srv.id, s.id, { unit_id: +$event.target.value })" />
+                      </label>
+                      <label title="Modificabile solo a server fermo.">
+                        Base address
+                        <input type="number" min="0"
+                               :value="s.base_address"
+                               :disabled="isLocked(srv.id)"
+                               @change="patchSensor(srv.id, s.id, { base_address: +$event.target.value })" />
+                      </label>
+                      <label title="Modificabile solo a server fermo.">
+                        Byte order
+                        <select :value="s.byte_order"
+                                :disabled="isLocked(srv.id)"
+                                @change="patchSensor(srv.id, s.id, { byte_order: $event.target.value })">
+                          <option value="big">big</option>
+                          <option value="little">little</option>
                         </select>
-                      </td>
-                      <td>
-                        <select :value="m.data_type"
-                                :disabled="isBitSpace(m.register_type)"
-                                @change="patchMeasurement(s.id, m.name, { data_type: $event.target.value })">
-                          <template x-for="dt in dataTypes" :key="dt"><option :value="dt" x-text="dt"></option></template>
+                      </label>
+                      <label title="Modificabile solo a server fermo.">
+                        Word order
+                        <select :value="s.word_order"
+                                :disabled="isLocked(srv.id)"
+                                @change="patchSensor(srv.id, s.id, { word_order: $event.target.value })">
+                          <option value="big">big</option>
+                          <option value="little">little</option>
                         </select>
-                      </td>
-                      <td>
-                        <input type="number" step="0.1" :value="m.scale"
-                               @change="patchMeasurement(s.id, m.name, { scale: +$event.target.value })" />
-                      </td>
-                      <td>
-                        <input type="number" step="0.1" :value="m.min_value"
-                               @change="patchMeasurement(s.id, m.name, { min_value: +$event.target.value })" />
-                        →
-                        <input type="number" step="0.1" :value="m.max_value"
-                               @change="patchMeasurement(s.id, m.name, { max_value: +$event.target.value })" />
-                      </td>
-                      <td>
-                        <input type="number" step="0.5" min="0.1" :value="m.update_rate"
-                               @change="patchMeasurement(s.id, m.name, { update_rate: +$event.target.value })" />s
-                      </td>
-                      <td class="fault-cell">
-                        <label title="Probabilità di errore in lettura per questa misura">
-                          err
-                          <input type="number" min="0" max="1" step="0.05" :value="m.fault.error_rate"
-                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, error_rate: +$event.target.value } })" />
-                        </label>
-                        <label class="check" title="Valore congelato: il simulatore non aggiorna più la misura">
-                          <input type="checkbox" :checked="m.fault.frozen"
-                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, frozen: $event.target.checked } })" />
-                          freeze
-                        </label>
-                        <label class="check" title="Drop writes: il simulatore non scrive sul registro">
-                          <input type="checkbox" :checked="m.fault.drop_writes"
-                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, drop_writes: $event.target.checked } })" />
-                          drop
-                        </label>
-                      </td>
-                      <td class="live-cell">
-                        <template x-if="latestFor(s.id, m.name)">
-                          <div>
-                            <span x-text="formatValue(latestFor(s.id, m.name))"></span>
-                            <small x-text="liveAddrInfo(latestFor(s.id, m.name))"></small>
-                          </div>
+                      </label>
+                      <label title="Sempre modificabile (live-reload).">
+                        Write rate (s)
+                        <input type="number" min="0.1" step="0.5"
+                               :value="s.write_rate_seconds"
+                               @change="patchSensor(srv.id, s.id, { write_rate_seconds: +$event.target.value })" />
+                      </label>
+                    </div>
+
+                    <fieldset class="fault">
+                      <legend>Fault injection (sensore) — sempre live</legend>
+                      <label>
+                        Latenza ms
+                        <input type="number" min="0" step="10" :value="s.fault.latency_ms"
+                               @change="patchSensor(srv.id, s.id, { fault: { ...s.fault, latency_ms: +$event.target.value } })" />
+                      </label>
+                      <label>
+                        Error rate (0..1)
+                        <input type="number" min="0" max="1" step="0.05" :value="s.fault.error_rate"
+                               @change="patchSensor(srv.id, s.id, { fault: { ...s.fault, error_rate: +$event.target.value } })" />
+                      </label>
+                      <label class="check">
+                        <input type="checkbox" :checked="s.fault.offline"
+                               @change="patchSensor(srv.id, s.id, { fault: { ...s.fault, offline: $event.target.checked } })" />
+                        Offline (slave non risponde)
+                      </label>
+                    </fieldset>
+
+                    <h5>Misure</h5>
+                    <template x-if="s.measurements.length === 0">
+                      <p class="empty">
+                        Nessuna misura. Seleziona questo sensore (clicca sull'header) e usa il catalogo a sinistra.
+                      </p>
+                    </template>
+                    <table x-show="s.measurements.length > 0">
+                      <thead>
+                        <tr>
+                          <th>Nome</th>
+                          <th>Offset</th>
+                          <th title="Modbus address space">Spazio</th>
+                          <th>Tipo</th>
+                          <th>Scale</th>
+                          <th>Range</th>
+                          <th>Rate</th>
+                          <th>Fault</th>
+                          <th>Live</th>
+                          <th></th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <template x-for="m in s.measurements" :key="m.name">
+                          <tr>
+                            <td><strong x-text="m.name"></strong><br /><small x-text="m.unit || ''"></small></td>
+                            <td>
+                              <input type="number" min="0" :value="m.offset"
+                                     :disabled="isLocked(srv.id)"
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { offset: +$event.target.value })" />
+                            </td>
+                            <td>
+                              <select :value="m.register_type"
+                                      :disabled="isLocked(srv.id)"
+                                      @change="patchMeasurement(srv.id, s.id, m.name, { register_type: $event.target.value })">
+                                <template x-for="rt in registerTypes" :key="rt">
+                                  <option :value="rt" x-text="rtLabel(rt)"></option>
+                                </template>
+                              </select>
+                            </td>
+                            <td>
+                              <select :value="m.data_type"
+                                      :disabled="isLocked(srv.id) || isBitSpace(m.register_type)"
+                                      @change="patchMeasurement(srv.id, s.id, m.name, { data_type: $event.target.value })">
+                                <template x-for="dt in dataTypes" :key="dt"><option :value="dt" x-text="dt"></option></template>
+                              </select>
+                            </td>
+                            <td>
+                              <input type="number" step="0.1" :value="m.scale"
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { scale: +$event.target.value })" />
+                            </td>
+                            <td>
+                              <input type="number" step="0.1" :value="m.min_value"
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { min_value: +$event.target.value })" />
+                              →
+                              <input type="number" step="0.1" :value="m.max_value"
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { max_value: +$event.target.value })" />
+                            </td>
+                            <td>
+                              <input type="number" step="0.5" min="0.1" :value="m.update_rate"
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { update_rate: +$event.target.value })" />s
+                            </td>
+                            <td class="fault-cell">
+                              <label title="Probabilità di errore in lettura per questa misura">
+                                err
+                                <input type="number" min="0" max="1" step="0.05" :value="m.fault.error_rate"
+                                       @change="patchMeasurement(srv.id, s.id, m.name, { fault: { ...m.fault, error_rate: +$event.target.value } })" />
+                              </label>
+                              <label class="check" title="Valore congelato: il simulatore non aggiorna più la misura">
+                                <input type="checkbox" :checked="m.fault.frozen"
+                                       @change="patchMeasurement(srv.id, s.id, m.name, { fault: { ...m.fault, frozen: $event.target.checked } })" />
+                                freeze
+                              </label>
+                              <label class="check" title="Drop writes: il simulatore non scrive sul registro">
+                                <input type="checkbox" :checked="m.fault.drop_writes"
+                                       @change="patchMeasurement(srv.id, s.id, m.name, { fault: { ...m.fault, drop_writes: $event.target.checked } })" />
+                                drop
+                              </label>
+                            </td>
+                            <td class="live-cell">
+                              <template x-if="latestFor(srv.id, s.id, m.name)">
+                                <div>
+                                  <span x-text="formatValue(latestFor(srv.id, s.id, m.name))"></span>
+                                  <small x-text="liveAddrInfo(latestFor(srv.id, s.id, m.name))"></small>
+                                </div>
+                              </template>
+                            </td>
+                            <td>
+                              <button class="btn danger small"
+                                      :disabled="isLocked(srv.id)"
+                                      @click="deleteMeasurement(srv.id, s.id, m.name)">
+                                ×
+                              </button>
+                            </td>
+                          </tr>
                         </template>
-                      </td>
-                      <td>
-                        <button class="btn danger small" @click="deleteMeasurement(s.id, m.name)">×</button>
-                      </td>
-                    </tr>
-                  </template>
-                </tbody>
-              </table>
+                      </tbody>
+                    </table>
+                  </div>
+                </article>
+              </template>
             </div>
           </article>
         </template>
       </section>
-
-      <!-- RIGHT: Live -->
-      <aside class="live">
-        <h2>Status live</h2>
-        <div class="kv">
-          <div><span>Server</span><strong :class="status.server.running ? 'ok' : 'off'" x-text="status.server.running ? 'running' : 'stopped'"></strong></div>
-          <div><span>Listen</span><strong x-text="status.server.host + ':' + status.server.port"></strong></div>
-          <div><span>Default unit</span><strong x-text="status.server.default_unit_id"></strong></div>
-          <div><span>Simulator</span><strong :class="status.simulator.running ? 'ok' : 'off'" x-text="status.simulator.running ? 'running' : 'stopped'"></strong></div>
-          <div><span>Sensori</span><strong x-text="config.sensors.length"></strong></div>
-          <div><span>Misure tot.</span><strong x-text="totalMeasurements()"></strong></div>
-        </div>
-
-        <h3>Slaves attivi</h3>
-        <ul class="slave-list" x-show="status.server.slaves && status.server.slaves.length">
-          <template x-for="sl in status.server.slaves" :key="sl.unit_id">
-            <li>
-              <strong>u<span x-text="sl.unit_id"></span></strong>
-              <span x-text="sl.registers + ' reg'"></span>
-            </li>
-          </template>
-        </ul>
-        <p class="hint" x-show="!status.server.slaves || !status.server.slaves.length">Server non avviato.</p>
-
-        <h3>Eventi</h3>
-        <ol class="events">
-          <template x-for="(e, i) in events" :key="i">
-            <li>
-              <small x-text="formatTime(e.timestamp)"></small>
-              <strong x-text="e.sensor_id + '/' + e.name"></strong>
-              <span x-text="formatValue(e)"></span>
-              <span class="addr" x-text="'@' + e.address"></span>
-              <template x-if="e.frozen"><span class="tag warn">frozen</span></template>
-              <template x-if="e.dropped"><span class="tag warn">drop</span></template>
-            </li>
-          </template>
-        </ol>
-      </aside>
     </main>
 
-    <section class="register-dump">
-      <header class="dump-header" @click="toggleDump()">
-        <h2>Vista registri (debug)</h2>
-        <span class="hint" x-text="dumpOpen ? '▾ chiudi' : '▸ apri'"></span>
-        <small x-show="dumpOpen && slaves.length === 0" class="hint">Avvia il server per popolare questa vista.</small>
+    <!-- Live + register dump (collapsible bottom area) -->
+    <section class="bottom-pane">
+      <header class="bp-head" @click="toggleDump()">
+        <h2>Live · status · registri</h2>
+        <small class="hint" x-text="dumpOpen ? '▾ chiudi' : '▸ apri'"></small>
+        <small class="hint" style="margin-left: auto;">
+          Server <strong x-text="config.servers?.length || 0"></strong>
+          · sensori <strong x-text="totalSensors()"></strong>
+          · misure <strong x-text="totalMeasurements()"></strong>
+        </small>
       </header>
-      <div x-show="dumpOpen" class="dump-body">
-        <template x-for="slave in slaves" :key="slave.unit_id">
-          <div class="slave">
-            <h3>Unit ID <span x-text="slave.unit_id"></span></h3>
-            <template x-for="space in slave.spaces" :key="space.register_type">
-              <div class="space">
+      <div x-show="dumpOpen" class="bp-body">
+        <div class="bp-grid">
+          <!-- Events -->
+          <div class="bp-section">
+            <h3>Eventi recenti</h3>
+            <ol class="events">
+              <template x-for="(e, i) in events" :key="i">
+                <li>
+                  <small x-text="formatTime(e.timestamp)"></small>
+                  <strong x-text="e.server_id + '/' + e.sensor_id + '/' + e.name"></strong>
+                  <span x-text="formatValue(e)"></span>
+                  <span class="addr" x-text="'@' + e.address"></span>
+                  <template x-if="e.frozen"><span class="tag warn">frozen</span></template>
+                  <template x-if="e.dropped"><span class="tag warn">drop</span></template>
+                </li>
+              </template>
+            </ol>
+          </div>
+
+          <!-- Register dump per server -->
+          <div class="bp-section">
+            <h3>Vista registri per server</h3>
+            <p class="hint" x-show="slavesByServer.length === 0">Nessun server in esecuzione.</p>
+            <template x-for="srvDump in slavesByServer" :key="srvDump.server_id">
+              <div class="server-dump">
                 <h4>
-                  <span x-text="rtLabel(space.register_type)"></span>
-                  <small x-text="'(' + space.register_type + ', ' + space.size + ' addr)'"></small>
+                  <span x-text="srvDump.server_id"></span>
+                  <small x-text="srvDump.host + ':' + srvDump.port"></small>
                 </h4>
-                <table class="reg-table">
-                  <thead>
-                    <tr>
-                      <th>Addr</th>
-                      <th x-show="!isBitSpace(space.register_type)">Hex</th>
-                      <th>Dec</th>
-                      <th>Sensore / Misura</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    <template x-for="(value, addr) in space.registers" :key="addr">
-                      <tr :class="{ 'has-owner': addressOwner(slave, space, addr) }">
-                        <td x-text="addr"></td>
-                        <td class="hex" x-show="!isBitSpace(space.register_type)"
-                            x-text="'0x' + value.toString(16).padStart(4, '0').toUpperCase()"></td>
-                        <td x-text="value"></td>
-                        <td>
-                          <template x-if="addressOwner(slave, space, addr)">
-                            <span>
-                              <strong x-text="addressOwner(slave, space, addr).sensorId + '.' + addressOwner(slave, space, addr).measurementName"></strong>
-                              <small x-text="addressOwner(slave, space, addr).hint"></small>
-                            </span>
-                          </template>
-                        </td>
-                      </tr>
+                <template x-for="slave in srvDump.slaves" :key="slave.unit_id">
+                  <div class="slave">
+                    <h5>Unit ID <span x-text="slave.unit_id"></span></h5>
+                    <template x-for="space in slave.spaces" :key="space.register_type">
+                      <div class="space">
+                        <h6>
+                          <span x-text="rtLabel(space.register_type)"></span>
+                          <small x-text="'(' + space.register_type + ', ' + space.size + ' addr)'"></small>
+                        </h6>
+                        <table class="reg-table">
+                          <thead>
+                            <tr>
+                              <th>Addr</th>
+                              <th x-show="!isBitSpace(space.register_type)">Hex</th>
+                              <th>Dec</th>
+                              <th>Sensore / Misura</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            <template x-for="(value, addr) in space.registers" :key="addr">
+                              <tr :class="{ 'has-owner': addressOwner(slave, space, addr) }">
+                                <td x-text="addr"></td>
+                                <td class="hex" x-show="!isBitSpace(space.register_type)"
+                                    x-text="'0x' + value.toString(16).padStart(4, '0').toUpperCase()"></td>
+                                <td x-text="value"></td>
+                                <td>
+                                  <template x-if="addressOwner(slave, space, addr)">
+                                    <span>
+                                      <strong x-text="addressOwner(slave, space, addr).sensorId + '.' + addressOwner(slave, space, addr).measurementName"></strong>
+                                      <small x-text="addressOwner(slave, space, addr).hint"></small>
+                                    </span>
+                                  </template>
+                                </td>
+                              </tr>
+                            </template>
+                          </tbody>
+                        </table>
+                      </div>
                     </template>
-                  </tbody>
-                </table>
+                  </div>
+                </template>
               </div>
             </template>
           </div>
-        </template>
+        </div>
       </div>
     </section>
 

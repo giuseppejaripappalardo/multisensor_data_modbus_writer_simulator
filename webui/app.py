@@ -5,6 +5,9 @@ Run with:
     uvicorn webui.app:app --host 0.0.0.0 --port 8000
 or via the convenience entry point:
     python -m webui
+
+Topology: AppConfig -> servers[] -> sensors[] -> measurements[]. Endpoints
+nest accordingly under /api/servers/{server_id}/sensors/{sensor_id}/...
 """
 from __future__ import annotations
 
@@ -13,9 +16,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from catalog import list_templates, get_template
 from models import (
@@ -26,6 +29,7 @@ from models import (
     RegisterType,
     SensorConfig,
     SensorFault,
+    ServerConfig,
     REGISTERS_PER_TYPE,
 )
 from utils.logging import setup_logging
@@ -62,8 +66,29 @@ runtime = Runtime(_load_initial_config(), persist_path=CONFIG_PATH)
 
 
 # --------------------------------------------------------------------------
-# Pydantic request/response models
+# Pydantic request models
 # --------------------------------------------------------------------------
+class ServerCreate(BaseModel):
+    id: str
+    label: Optional[str] = None
+    description: Optional[str] = None
+    host: str = "0.0.0.0"
+    port: int = Field(default=502, ge=1, le=65535)
+    default_unit_id: int = Field(default=1, ge=0, le=247)
+    register_count_min: int = Field(default=16, ge=1)
+    auto_start: bool = False
+
+
+class ServerUpdate(BaseModel):
+    label: Optional[str] = None
+    description: Optional[str] = None
+    host: Optional[str] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    default_unit_id: Optional[int] = Field(default=None, ge=0, le=247)
+    register_count_min: Optional[int] = Field(default=None, ge=1)
+    auto_start: Optional[bool] = None
+
+
 class SensorCreate(BaseModel):
     id: str
     unit_id: int = 1
@@ -83,7 +108,7 @@ class SensorUpdate(BaseModel):
 
 
 class MeasurementCreate(BaseModel):
-    template_name: Optional[str] = None        # if set, prefill from catalog
+    template_name: Optional[str] = None
     name: Optional[str] = None
     offset: int
     register_type: Optional[RegisterType] = None
@@ -107,24 +132,58 @@ class MeasurementUpdate(BaseModel):
     fault: Optional[MeasurementFault] = None
 
 
+class SpikeRequest(BaseModel):
+    value: float
+    duration_seconds: float = Field(gt=0)
+
+
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
+# Fields that require the server to be stopped before they can be edited.
+# Live-reloadable fields (faults, scale, ranges, update_rate) are not listed
+# and remain editable while the server is running.
+_SERVER_STRUCTURAL = {"host", "port", "register_count_min", "default_unit_id"}
+_SENSOR_STRUCTURAL = {"unit_id", "base_address", "byte_order", "word_order"}
+_MEASUREMENT_STRUCTURAL = {"offset", "register_type", "data_type"}
+
+
+def _validation_errors_to_json(e: ValidationError) -> List[dict]:
+    """
+    pydantic v2 ValidationError carries the original Python exception in
+    `ctx['error']` for model_validator failures, which is not JSON-serializable.
+    Return only the JSON-safe fields.
+    """
+    out: List[dict] = []
+    for err in e.errors():
+        out.append({
+            "type": err.get("type"),
+            "loc": list(err.get("loc", ())),
+            "msg": err.get("msg"),
+        })
+    return out
+
+
 def _replace(config: AppConfig) -> AppConfig:
-    runtime.replace_config(config)
+    try:
+        runtime.replace_config(config)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_validation_errors_to_json(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return runtime.config
 
 
-def _next_offset(sensor: SensorConfig) -> int:
-    """Return the smallest non-overlapping offset after existing measurements."""
-    if not sensor.measurements:
-        return 0
-    last = max(m.offset + m.register_count for m in sensor.measurements)
-    return last
+def _find_server(config: AppConfig, server_id: str) -> ServerConfig:
+    s = config.find_server(server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail=f"Server not found: {server_id}")
+    return s
 
 
-def _find_sensor(config: AppConfig, sensor_id: str) -> SensorConfig:
-    for s in config.sensors:
+def _find_sensor(server: ServerConfig, sensor_id: str) -> SensorConfig:
+    for s in server.sensors:
         if s.id == sensor_id:
             return s
     raise HTTPException(status_code=404, detail=f"Sensor not found: {sensor_id}")
@@ -135,6 +194,43 @@ def _find_measurement(sensor: SensorConfig, name: str) -> MeasurementConfig:
         if m.name == name:
             return m
     raise HTTPException(status_code=404, detail=f"Measurement not found: {name}")
+
+
+def _assert_editable(server_id: str, patch_keys: set, structural: set, what: str) -> None:
+    """
+    Reject structural edits when the server is running. Live-reloadable
+    fields (anything not in `structural`) are always allowed.
+    """
+    if not runtime.is_server_running(server_id):
+        return
+    blocked = patch_keys & structural
+    if blocked:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Server '{server_id}' is running: {what} field(s) "
+                f"{sorted(blocked)} cannot be edited live. Stop the server first."
+            ),
+        )
+
+
+def _new_config_with(*, mutate) -> AppConfig:
+    """
+    Deep-copy the live config, apply `mutate(cfg)`, and validate-then-replace.
+    `mutate` may raise HTTPException to abort. Pydantic ValidationError raised
+    during model construction inside `mutate` (e.g. invalid server id, sensor
+    field constraint) is caught here and surfaced as 422.
+    """
+    cfg = runtime.config.model_copy(deep=True)
+    try:
+        mutate(cfg)
+        validated = AppConfig(**cfg.model_dump())
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=_validation_errors_to_json(e))
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    _replace(validated)
+    return runtime.config
 
 
 # --------------------------------------------------------------------------
@@ -183,56 +279,216 @@ def put_config(config: AppConfig):
     return _replace(config).model_dump(mode="json")
 
 
-# ---- Sensors -------------------------------------------------------------
+# ---- Servers (CRUD) ------------------------------------------------------
 
-@app.post("/api/sensors")
-def create_sensor(sensor: SensorCreate):
-    cfg = runtime.config
-    if any(s.id == sensor.id for s in cfg.sensors):
-        raise HTTPException(status_code=409, detail="Sensor id already exists")
-    new_cfg = cfg.model_copy(deep=True)
-    new_cfg.sensors.append(SensorConfig(
-        id=sensor.id,
-        unit_id=sensor.unit_id,
-        base_address=sensor.base_address,
-        byte_order=sensor.byte_order,
-        word_order=sensor.word_order,
-        write_rate_seconds=sensor.write_rate_seconds,
-        measurements=[],
-    ))
-    _replace(new_cfg)
-    return _find_sensor(runtime.config, sensor.id).model_dump(mode="json")
+@app.get("/api/servers")
+def list_servers():
+    return {"servers": [sc.model_dump(mode="json") for sc in runtime.config.servers]}
 
 
-@app.put("/api/sensors/{sensor_id}")
-def update_sensor(sensor_id: str, patch: SensorUpdate):
-    cfg = runtime.config.model_copy(deep=True)
-    sensor = _find_sensor(cfg, sensor_id)
+@app.get("/api/servers/{server_id}")
+def get_server(server_id: str):
+    sc = _find_server(runtime.config, server_id)
+    return sc.model_dump(mode="json")
+
+
+@app.post("/api/servers")
+def create_server(payload: ServerCreate):
+    if runtime.config.find_server(payload.id) is not None:
+        raise HTTPException(status_code=409, detail=f"Server id already exists: {payload.id}")
+
+    def _mutate(cfg: AppConfig) -> None:
+        cfg.servers.append(ServerConfig(
+            id=payload.id,
+            label=payload.label,
+            description=payload.description,
+            host=payload.host,
+            port=payload.port,
+            default_unit_id=payload.default_unit_id,
+            register_count_min=payload.register_count_min,
+            auto_start=payload.auto_start,
+            sensors=[],
+        ))
+
+    _new_config_with(mutate=_mutate)
+    return runtime.server_status(payload.id)
+
+
+@app.put("/api/servers/{server_id}")
+def update_server(server_id: str, patch: ServerUpdate):
     updates = patch.model_dump(exclude_unset=True, exclude_none=True)
-    # Rebuild via the model so nested fields (fault) get re-validated as
-    # SensorFault, not as a plain dict. model_copy(update=...) bypasses
-    # validation on nested models in pydantic v2.
-    merged = {**sensor.model_dump(), **updates}
-    new_sensor = SensorConfig(**merged)
-    cfg.sensors = [new_sensor if s.id == sensor_id else s for s in cfg.sensors]
-    _replace(cfg)
-    return new_sensor.model_dump(mode="json")
+    _assert_editable(server_id, set(updates.keys()), _SERVER_STRUCTURAL, "server")
+
+    def _mutate(cfg: AppConfig) -> None:
+        sc = _find_server(cfg, server_id)
+        for k, v in updates.items():
+            setattr(sc, k, v)
+
+    _new_config_with(mutate=_mutate)
+    return runtime.server_status(server_id)
 
 
-@app.delete("/api/sensors/{sensor_id}")
-def delete_sensor(sensor_id: str):
-    cfg = runtime.config.model_copy(deep=True)
-    cfg.sensors = [s for s in cfg.sensors if s.id != sensor_id]
-    _replace(cfg)
+@app.delete("/api/servers/{server_id}")
+def delete_server(server_id: str):
+    _find_server(runtime.config, server_id)  # 404 if missing
+    if runtime.is_server_running(server_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is running: stop it before deleting.",
+        )
+
+    def _mutate(cfg: AppConfig) -> None:
+        cfg.servers = [s for s in cfg.servers if s.id != server_id]
+
+    _new_config_with(mutate=_mutate)
+    return {"deleted": server_id}
+
+
+# ---- Server lifecycle ----------------------------------------------------
+
+@app.post("/api/servers/{server_id}/start")
+def start_server(server_id: str):
+    _find_server(runtime.config, server_id)
+    try:
+        runtime.start_server(server_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return runtime.server_status(server_id)
+
+
+@app.post("/api/servers/{server_id}/stop")
+def stop_server(server_id: str):
+    _find_server(runtime.config, server_id)
+    runtime.stop_server(server_id)
+    return runtime.server_status(server_id)
+
+
+@app.post("/api/servers/{server_id}/kick")
+def kick_server(server_id: str):
+    _find_server(runtime.config, server_id)
+    try:
+        runtime.kick_server(server_id)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return runtime.server_status(server_id)
+
+
+@app.post("/api/servers/{server_id}/simulator/start")
+def start_simulator(server_id: str):
+    _find_server(runtime.config, server_id)
+    ok = runtime.start_simulator(server_id)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Failed to start simulator")
+    return runtime.server_status(server_id)
+
+
+@app.post("/api/servers/{server_id}/simulator/stop")
+def stop_simulator(server_id: str):
+    _find_server(runtime.config, server_id)
+    runtime.stop_simulator(server_id)
+    return runtime.server_status(server_id)
+
+
+# ---- Bulk lifecycle ------------------------------------------------------
+
+@app.post("/api/servers/start-all")
+def start_all_servers():
+    runtime.start_all_servers()
+    return {"servers": runtime.all_servers_status()}
+
+
+@app.post("/api/servers/stop-all")
+def stop_all_servers():
+    runtime.stop_all_servers()
+    return {"servers": runtime.all_servers_status()}
+
+
+@app.post("/api/simulator/start-all")
+def start_all_simulators():
+    runtime.start_all_simulators()
+    return {"servers": runtime.all_servers_status()}
+
+
+@app.post("/api/simulator/stop-all")
+def stop_all_simulators():
+    runtime.stop_all_simulators()
+    return {"servers": runtime.all_servers_status()}
+
+
+# ---- Sensors (nested under server) ---------------------------------------
+
+@app.post("/api/servers/{server_id}/sensors")
+def create_sensor(server_id: str, payload: SensorCreate):
+    if runtime.is_server_running(server_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is running: stop it before adding sensors.",
+        )
+    sc = _find_server(runtime.config, server_id)
+    if any(s.id == payload.id for s in sc.sensors):
+        raise HTTPException(status_code=409, detail="Sensor id already exists in this server")
+
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        srv.sensors.append(SensorConfig(
+            id=payload.id,
+            unit_id=payload.unit_id,
+            base_address=payload.base_address,
+            byte_order=payload.byte_order,
+            word_order=payload.word_order,
+            write_rate_seconds=payload.write_rate_seconds,
+            measurements=[],
+        ))
+
+    _new_config_with(mutate=_mutate)
+    sc = _find_server(runtime.config, server_id)
+    return _find_sensor(sc, payload.id).model_dump(mode="json")
+
+
+@app.put("/api/servers/{server_id}/sensors/{sensor_id}")
+def update_sensor(server_id: str, sensor_id: str, patch: SensorUpdate):
+    updates = patch.model_dump(exclude_unset=True, exclude_none=True)
+    _assert_editable(server_id, set(updates.keys()), _SENSOR_STRUCTURAL, "sensor")
+
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        sensor = _find_sensor(srv, sensor_id)
+        merged = {**sensor.model_dump(), **updates}
+        new_sensor = SensorConfig(**merged)
+        srv.sensors = [new_sensor if s.id == sensor_id else s for s in srv.sensors]
+
+    _new_config_with(mutate=_mutate)
+    sc = _find_server(runtime.config, server_id)
+    return _find_sensor(sc, sensor_id).model_dump(mode="json")
+
+
+@app.delete("/api/servers/{server_id}/sensors/{sensor_id}")
+def delete_sensor(server_id: str, sensor_id: str):
+    if runtime.is_server_running(server_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is running: stop it before deleting sensors.",
+        )
+
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        srv.sensors = [s for s in srv.sensors if s.id != sensor_id]
+
+    _new_config_with(mutate=_mutate)
     return {"deleted": sensor_id}
 
 
 # ---- Measurements --------------------------------------------------------
 
-@app.post("/api/sensors/{sensor_id}/measurements")
-def create_measurement(sensor_id: str, payload: MeasurementCreate):
-    cfg = runtime.config.model_copy(deep=True)
-    sensor = _find_sensor(cfg, sensor_id)
+@app.post("/api/servers/{server_id}/sensors/{sensor_id}/measurements")
+def create_measurement(server_id: str, sensor_id: str, payload: MeasurementCreate):
+    if runtime.is_server_running(server_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is running: stop it before adding measurements.",
+        )
+    sc = _find_server(runtime.config, server_id)
+    sensor = _find_sensor(sc, sensor_id)
 
     template = get_template(payload.template_name) if payload.template_name else None
     name = payload.name or (template.name if template else None)
@@ -242,7 +498,6 @@ def create_measurement(sensor_id: str, payload: MeasurementCreate):
         raise HTTPException(status_code=409, detail="Measurement name already exists for this sensor")
 
     base = template.model_dump() if template else {}
-    # Drop fields that don't belong to MeasurementConfig.
     for k in ("label", "description", "generator"):
         base.pop(k, None)
     base.update({
@@ -252,83 +507,70 @@ def create_measurement(sensor_id: str, payload: MeasurementCreate):
            if k not in ("template_name", "name") and v is not None},
     })
 
-    measurement = MeasurementConfig(**base)
-    # Overlap sanity check — only against measurements in the *same*
-    # register_type address space (coil 0 and holding 0 are independent).
-    end = measurement.offset + measurement.register_count - 1
-    for m in sensor.measurements:
-        if m.register_type != measurement.register_type:
-            continue
-        m_end = m.offset + m.register_count - 1
-        if m.offset <= end and measurement.offset <= m_end:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Address overlap with '{m.name}' "
-                       f"({m.register_type.value} {m.offset}..{m_end})",
-            )
-    sensor.measurements.append(measurement)
-    _replace(cfg)
-    return measurement.model_dump(mode="json")
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        s = _find_sensor(srv, sensor_id)
+        s.measurements.append(MeasurementConfig(**base))
+
+    _new_config_with(mutate=_mutate)
+    return _find_measurement(
+        _find_sensor(_find_server(runtime.config, server_id), sensor_id), name,
+    ).model_dump(mode="json")
 
 
-@app.put("/api/sensors/{sensor_id}/measurements/{name}")
-def update_measurement(sensor_id: str, name: str, patch: MeasurementUpdate):
-    cfg = runtime.config.model_copy(deep=True)
-    sensor = _find_sensor(cfg, sensor_id)
-    m = _find_measurement(sensor, name)
+@app.put("/api/servers/{server_id}/sensors/{sensor_id}/measurements/{name}")
+def update_measurement(
+    server_id: str, sensor_id: str, name: str, patch: MeasurementUpdate,
+):
     updates = patch.model_dump(exclude_unset=True, exclude_none=True)
-    # Rebuild via the model so the nested fault dict is re-validated as
-    # MeasurementFault (model_copy(update=...) does NOT re-validate nested
-    # models in pydantic v2 -> they would silently remain plain dicts).
-    merged = {**m.model_dump(), **updates}
-    new_m = MeasurementConfig(**merged)
+    _assert_editable(server_id, set(updates.keys()), _MEASUREMENT_STRUCTURAL, "measurement")
 
-    # Overlap check after the patch — only against measurements in the
-    # same register_type address space (changing offset / register_type /
-    # data_type can introduce overlaps).
-    new_end = new_m.offset + new_m.register_count - 1
-    for x in sensor.measurements:
-        if x.name == name:
-            continue
-        if x.register_type != new_m.register_type:
-            continue
-        x_end = x.offset + x.register_count - 1
-        if x.offset <= new_end and new_m.offset <= x_end:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Address overlap with '{x.name}' "
-                       f"({x.register_type.value} {x.offset}..{x_end})",
-            )
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        sensor = _find_sensor(srv, sensor_id)
+        m = _find_measurement(sensor, name)
+        merged = {**m.model_dump(), **updates}
+        new_m = MeasurementConfig(**merged)
+        sensor.measurements = [new_m if x.name == name else x for x in sensor.measurements]
 
-    sensor.measurements = [new_m if x.name == name else x for x in sensor.measurements]
-    _replace(cfg)
-    return new_m.model_dump(mode="json")
+    _new_config_with(mutate=_mutate)
+    sc = _find_server(runtime.config, server_id)
+    sensor = _find_sensor(sc, sensor_id)
+    return _find_measurement(sensor, name).model_dump(mode="json")
 
 
-@app.delete("/api/sensors/{sensor_id}/measurements/{name}")
-def delete_measurement(sensor_id: str, name: str):
-    cfg = runtime.config.model_copy(deep=True)
-    sensor = _find_sensor(cfg, sensor_id)
-    sensor.measurements = [m for m in sensor.measurements if m.name != name]
-    _replace(cfg)
+@app.delete("/api/servers/{server_id}/sensors/{sensor_id}/measurements/{name}")
+def delete_measurement(server_id: str, sensor_id: str, name: str):
+    if runtime.is_server_running(server_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Server '{server_id}' is running: stop it before deleting measurements.",
+        )
+
+    def _mutate(cfg: AppConfig) -> None:
+        srv = _find_server(cfg, server_id)
+        sensor = _find_sensor(srv, sensor_id)
+        sensor.measurements = [m for m in sensor.measurements if m.name != name]
+
+    _new_config_with(mutate=_mutate)
     return {"deleted": name}
 
 
-class SpikeRequest(BaseModel):
-    value: float
-    duration_seconds: float = Field(gt=0)
+# ---- Spikes --------------------------------------------------------------
 
-
-@app.post("/api/sensors/{sensor_id}/measurements/{name}/spike")
-def inject_spike(sensor_id: str, name: str, payload: SpikeRequest):
-    """One-shot value override: replace the generated value for N seconds."""
-    sensor = _find_sensor(runtime.config, sensor_id)
-    _find_measurement(sensor, name)  # 404 if missing
+@app.post("/api/servers/{server_id}/sensors/{sensor_id}/measurements/{name}/spike")
+def inject_spike(
+    server_id: str, sensor_id: str, name: str, payload: SpikeRequest,
+):
+    sc = _find_server(runtime.config, server_id)
+    sensor = _find_sensor(sc, sensor_id)
+    _find_measurement(sensor, name)
     try:
-        runtime.inject_spike(sensor_id, name, payload.value, payload.duration_seconds)
+        runtime.inject_spike(server_id, sensor_id, name, payload.value, payload.duration_seconds)
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return {
+        "server_id": server_id,
         "sensor_id": sensor_id,
         "name": name,
         "value": payload.value,
@@ -336,51 +578,10 @@ def inject_spike(sensor_id: str, name: str, payload: SpikeRequest):
     }
 
 
-@app.delete("/api/sensors/{sensor_id}/measurements/{name}/spike")
-def clear_spike(sensor_id: str, name: str):
-    cleared = runtime.clear_spike(sensor_id, name)
+@app.delete("/api/servers/{server_id}/sensors/{sensor_id}/measurements/{name}/spike")
+def clear_spike(server_id: str, sensor_id: str, name: str):
+    cleared = runtime.clear_spike(server_id, sensor_id, name)
     return {"cleared": cleared}
-
-
-# ---- Lifecycle controls --------------------------------------------------
-
-@app.post("/api/server/start")
-def server_start():
-    try:
-        runtime.start_server()
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return runtime.server_status()
-
-
-@app.post("/api/server/stop")
-def server_stop():
-    runtime.stop_server()
-    return runtime.server_status()
-
-
-@app.post("/api/server/kick")
-def server_kick():
-    """Drop all active TCP connections; clients will receive a close/RST."""
-    try:
-        runtime.kick_clients()
-    except RuntimeError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return runtime.server_status()
-
-
-@app.post("/api/simulator/start")
-def simulator_start():
-    ok = runtime.start_simulator()
-    if not ok:
-        raise HTTPException(status_code=500, detail="Failed to start simulator")
-    return runtime.simulator_status()
-
-
-@app.post("/api/simulator/stop")
-def simulator_stop():
-    runtime.stop_simulator()
-    return runtime.simulator_status()
 
 
 # ---- Live status ---------------------------------------------------------
@@ -388,8 +589,7 @@ def simulator_stop():
 @app.get("/api/status")
 def status():
     return {
-        "server": runtime.server_status(),
-        "simulator": runtime.simulator_status(),
+        "servers": runtime.all_servers_status(),
         "values": runtime.latest_values(),
     }
 
@@ -401,8 +601,5 @@ def events(limit: int = 50):
 
 @app.get("/api/slaves")
 def slaves():
-    """
-    Per-slave register dump for debugging. Each slave reports its full
-    register bank, plus the sensor/measurement layout that owns each address.
-    """
-    return {"slaves": runtime.slave_dump()}
+    """Per-server, per-slave register dump for debugging."""
+    return {"servers": runtime.slave_dump()}

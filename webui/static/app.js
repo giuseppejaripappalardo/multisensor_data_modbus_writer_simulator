@@ -3,18 +3,22 @@ document.addEventListener("alpine:init", () => {
     catalog: [],
     dataTypes: [],
     registerTypes: [],
-    config: { sensors: [], modbus: {}, server: {} },
-    status: {
-      server: { running: false, host: "-", port: 0, unit_id: 0 },
-      simulator: { running: false },
-      values: [],
-    },
+    config: { servers: [], modbus: {}, tick_seconds: 1.0, log_level: "INFO" },
+    status: { servers: [], values: [] },
     events: [],
-    latestMap: {},   // { "sensor:measurement": value-object }
-    slaves: [],      // raw register dump per unit_id
+    // Latest values keyed by `${serverId}:${sensorId}:${name}`.
+    latestMap: {},
+    // Per-server raw register dump.
+    slavesByServer: [],
     dumpOpen: false,
-    selectedSensorId: null,
-    newSensor: { id: "", unit_id: 1, base_address: 0, byte_order: "big", word_order: "big", write_rate_seconds: 1.0 },
+    // (serverId, sensorId) currently expanded in the catalog "+ Add" target.
+    selectedTarget: { serverId: null, sensorId: null },
+    // One pending "new sensor" form per server, keyed by serverId.
+    newSensorByServer: {},
+    newServer: {
+      id: "", label: "", host: "0.0.0.0", port: 5020,
+      default_unit_id: 1, register_count_min: 16, auto_start: false,
+    },
     message: "",
     pollHandle: null,
 
@@ -33,6 +37,9 @@ document.addEventListener("alpine:init", () => {
       if (!res.ok) {
         let detail = await res.text();
         try { detail = JSON.parse(detail).detail || detail; } catch (_) {}
+        if (Array.isArray(detail)) {
+          detail = detail.map(d => d.msg || JSON.stringify(d)).join("; ");
+        }
         this.flash("Errore: " + detail, true);
         throw new Error(detail);
       }
@@ -56,8 +63,16 @@ document.addEventListener("alpine:init", () => {
     },
     async refreshConfig() {
       this.config = await this.fetchJSON("GET", "/api/config");
-      if (!this.selectedSensorId && this.config.sensors.length > 0) {
-        this.selectedSensorId = this.config.sensors[0].id;
+      // Ensure each server has a "new sensor" form scaffold.
+      for (const srv of this.config.servers) {
+        if (!this.newSensorByServer[srv.id]) {
+          this.newSensorByServer[srv.id] = this.blankNewSensor(srv);
+        }
+      }
+      // Drop scaffolds for deleted servers.
+      const liveIds = new Set(this.config.servers.map(s => s.id));
+      for (const sid of Object.keys(this.newSensorByServer)) {
+        if (!liveIds.has(sid)) delete this.newSensorByServer[sid];
       }
     },
     async refreshStatus() {
@@ -65,13 +80,15 @@ document.addEventListener("alpine:init", () => {
         const s = await this.fetchJSON("GET", "/api/status");
         this.status = s;
         const map = {};
-        for (const v of s.values) map[`${v.sensor_id}:${v.name}`] = v;
+        for (const v of s.values) {
+          map[`${v.server_id}:${v.sensor_id}:${v.name}`] = v;
+        }
         this.latestMap = map;
         const ev = await this.fetchJSON("GET", "/api/events?limit=40");
         this.events = ev.events;
         if (this.dumpOpen) {
           const sl = await this.fetchJSON("GET", "/api/slaves");
-          this.slaves = sl.slaves;
+          this.slavesByServer = sl.servers;
         }
       } catch (_) { /* poller error: silent */ }
     },
@@ -81,6 +98,20 @@ document.addEventListener("alpine:init", () => {
       if (this.dumpOpen) await this.refreshStatus();
     },
 
+    // ---- Status helpers ----
+    serverStatus(serverId) {
+      return (this.status.servers || []).find(s => s.id === serverId)
+        || { running: false, simulator_running: false, slaves: [] };
+    },
+    anyServerRunning() {
+      return (this.status.servers || []).some(s => s.running);
+    },
+    runningServerCount() {
+      return (this.status.servers || []).filter(s => s.running).length;
+    },
+    isLocked(serverId) {
+      return this.serverStatus(serverId).running;
+    },
     addressOwner(slave, space, addr) {
       const rt = space.register_type;
       for (const s of slave.sensors) {
@@ -98,11 +129,9 @@ document.addEventListener("alpine:init", () => {
       }
       return null;
     },
-
     isBitSpace(rt) {
       return rt === "coil" || rt === "discrete_input";
     },
-
     rtLabel(rt) {
       const map = {
         coil: "Coil",
@@ -113,65 +142,179 @@ document.addEventListener("alpine:init", () => {
       return map[rt] || rt;
     },
 
-    // ---- Sensor ops ----
-    async createSensor() {
-      if (!this.newSensor.id.trim()) {
-        this.flash("Devi specificare un id univoco");
+    // ---- Server CRUD + lifecycle ----
+    blankNewSensor(srv) {
+      return {
+        id: "",
+        unit_id: srv.default_unit_id || 1,
+        base_address: 0,
+        byte_order: "big",
+        word_order: "big",
+        write_rate_seconds: 1.0,
+      };
+    },
+    async createServer() {
+      if (!this.newServer.id.trim()) {
+        this.flash("Devi specificare un id univoco per il server");
         return;
       }
-      const created = await this.fetchJSON("POST", "/api/sensors", { ...this.newSensor });
-      await this.refreshConfig();
-      this.selectedSensorId = created.id;
-      this.newSensor = { id: "", unit_id: this.suggestNextUnitId(), base_address: this.suggestNextBase(), byte_order: "big", word_order: "big", write_rate_seconds: 1.0 };
-      this.flash(`Sensore '${created.id}' creato`);
+      try {
+        await this.fetchJSON("POST", "/api/servers", { ...this.newServer });
+        await this.refreshConfig();
+        await this.refreshStatus();
+        this.flash(`Server '${this.newServer.id}' creato`);
+        this.newServer = {
+          id: "", label: "", host: "0.0.0.0",
+          port: this.suggestNextPort(),
+          default_unit_id: 1, register_count_min: 16, auto_start: false,
+        };
+      } catch (_) { /* flashed */ }
     },
-    async patchSensor(id, patch) {
-      await this.fetchJSON("PUT", `/api/sensors/${id}`, patch);
-      await this.refreshConfig();
+    suggestNextPort() {
+      const used = (this.config.servers || []).map(s => s.port);
+      if (used.length === 0) return 5020;
+      return Math.max(...used) + 1;
     },
-    async deleteSensor(id) {
-      if (!confirm(`Eliminare il sensore '${id}'?`)) return;
-      await this.fetchJSON("DELETE", `/api/sensors/${id}`);
-      if (this.selectedSensorId === id) this.selectedSensorId = null;
-      await this.refreshConfig();
+    async patchServer(serverId, patch) {
+      try {
+        await this.fetchJSON("PUT", `/api/servers/${serverId}`, patch);
+        await this.refreshConfig();
+      } catch (_) { /* flashed */ }
     },
-    suggestNextBase() {
-      const bases = this.config.sensors.map((s) => s.base_address);
-      if (bases.length === 0) return 0;
+    async deleteServer(serverId) {
+      if (!confirm(`Eliminare il server '${serverId}' e tutti i suoi sensori?`)) return;
+      try {
+        await this.fetchJSON("DELETE", `/api/servers/${serverId}`);
+        await this.refreshConfig();
+        await this.refreshStatus();
+      } catch (_) { /* flashed */ }
+    },
+    async toggleServerLifecycle(serverId) {
+      const running = this.serverStatus(serverId).running;
+      const url = running
+        ? `/api/servers/${serverId}/stop`
+        : `/api/servers/${serverId}/start`;
+      try {
+        await this.fetchJSON("POST", url);
+        await this.refreshStatus();
+      } catch (_) { /* flashed */ }
+    },
+    async toggleSimulator(serverId) {
+      const running = this.serverStatus(serverId).simulator_running;
+      const url = running
+        ? `/api/servers/${serverId}/simulator/stop`
+        : `/api/servers/${serverId}/simulator/start`;
+      try {
+        await this.fetchJSON("POST", url);
+        await this.refreshStatus();
+      } catch (_) { /* flashed */ }
+    },
+    async kickServer(serverId) {
+      try {
+        await this.fetchJSON("POST", `/api/servers/${serverId}/kick`);
+        await this.refreshStatus();
+      } catch (_) { /* flashed */ }
+    },
+    async startAll() {
+      try {
+        await this.fetchJSON("POST", "/api/servers/start-all");
+        await this.fetchJSON("POST", "/api/simulator/start-all");
+        await this.refreshStatus();
+      } catch (_) {}
+    },
+    async stopAll() {
+      try {
+        await this.fetchJSON("POST", "/api/simulator/stop-all");
+        await this.fetchJSON("POST", "/api/servers/stop-all");
+        await this.refreshStatus();
+      } catch (_) {}
+    },
+
+    // ---- Sensor CRUD ----
+    async createSensor(serverId) {
+      const draft = this.newSensorByServer[serverId];
+      if (!draft || !draft.id.trim()) {
+        this.flash("Devi specificare un id univoco per il sensore");
+        return;
+      }
+      try {
+        const created = await this.fetchJSON(
+          "POST", `/api/servers/${serverId}/sensors`, { ...draft },
+        );
+        await this.refreshConfig();
+        this.selectedTarget = { serverId, sensorId: created.id };
+        const srv = this.config.servers.find(s => s.id === serverId);
+        this.newSensorByServer[serverId] = this.blankNewSensor(srv);
+        this.newSensorByServer[serverId].unit_id = this.suggestNextUnitId(serverId);
+        this.newSensorByServer[serverId].base_address = this.suggestNextBase(serverId);
+        this.flash(`Sensore '${created.id}' creato in '${serverId}'`);
+      } catch (_) { /* flashed */ }
+    },
+    async patchSensor(serverId, sensorId, patch) {
+      try {
+        await this.fetchJSON("PUT", `/api/servers/${serverId}/sensors/${sensorId}`, patch);
+        await this.refreshConfig();
+      } catch (_) { /* flashed */ }
+    },
+    async deleteSensor(serverId, sensorId) {
+      if (!confirm(`Eliminare il sensore '${sensorId}' dal server '${serverId}'?`)) return;
+      try {
+        await this.fetchJSON("DELETE", `/api/servers/${serverId}/sensors/${sensorId}`);
+        if (this.selectedTarget.sensorId === sensorId) {
+          this.selectedTarget = { serverId: null, sensorId: null };
+        }
+        await this.refreshConfig();
+      } catch (_) {}
+    },
+    suggestNextBase(serverId) {
+      const srv = this.config.servers.find(s => s.id === serverId);
+      if (!srv || srv.sensors.length === 0) return 0;
+      const bases = srv.sensors.map(s => s.base_address);
       return Math.max(...bases) + 20;
     },
-    suggestNextUnitId() {
-      const used = new Set(this.config.sensors.map((s) => s.unit_id));
-      const def = this.status.server.default_unit_id || 1;
+    suggestNextUnitId(serverId) {
+      const srv = this.config.servers.find(s => s.id === serverId);
+      if (!srv) return 1;
+      const used = new Set(srv.sensors.map(s => s.unit_id));
+      const def = srv.default_unit_id || 1;
       if (used.size === 0) return def;
       let next = Math.max(...used) + 1;
       if (next < 1) next = 1;
       return Math.min(next, 247);
     },
 
-    // ---- Measurement ops ----
+    // ---- Measurement CRUD ----
+    selectTarget(serverId, sensorId) {
+      this.selectedTarget = { serverId, sensorId };
+    },
+    isTargetSelected(serverId, sensorId) {
+      return this.selectedTarget.serverId === serverId
+        && this.selectedTarget.sensorId === sensorId;
+    },
     async addMeasurementFromTemplate(t) {
-      if (!this.selectedSensorId) {
-        this.flash("Seleziona prima un sensore");
+      const { serverId, sensorId } = this.selectedTarget;
+      if (!serverId || !sensorId) {
+        this.flash("Seleziona prima un sensore (cliccando sull'header)");
         return;
       }
-      const sensor = this.config.sensors.find((s) => s.id === this.selectedSensorId);
+      const srv = this.config.servers.find(s => s.id === serverId);
+      const sensor = srv && srv.sensors.find(s => s.id === sensorId);
+      if (!sensor) return;
       const next = this.nextOffset(sensor, t.register_type);
       try {
-        await this.fetchJSON("POST", `/api/sensors/${sensor.id}/measurements`, {
-          template_name: t.name,
-          offset: next,
-        });
+        await this.fetchJSON(
+          "POST",
+          `/api/servers/${serverId}/sensors/${sensorId}/measurements`,
+          { template_name: t.name, offset: next },
+        );
         await this.refreshConfig();
-        this.flash(`Aggiunta '${t.label}' al sensore ${sensor.id}`);
-      } catch (e) { /* already flashed */ }
+        this.flash(`Aggiunta '${t.label}' a ${serverId}/${sensorId}`);
+      } catch (_) {}
     },
     nextOffset(sensor, registerType) {
-      // Each address space has its own offsets — only consider measurements
-      // that share the same register_type.
       if (!sensor) return 0;
       const same = sensor.measurements.filter(
-        (m) => !registerType || m.register_type === registerType,
+        m => !registerType || m.register_type === registerType,
       );
       if (same.length === 0) return 0;
       let max = 0;
@@ -192,30 +335,29 @@ document.addEventListener("alpine:init", () => {
         default: return 1;
       }
     },
-    async patchMeasurement(sensorId, name, patch) {
-      await this.fetchJSON("PUT", `/api/sensors/${sensorId}/measurements/${name}`, patch);
-      await this.refreshConfig();
+    async patchMeasurement(serverId, sensorId, name, patch) {
+      try {
+        await this.fetchJSON(
+          "PUT",
+          `/api/servers/${serverId}/sensors/${sensorId}/measurements/${name}`,
+          patch,
+        );
+        await this.refreshConfig();
+      } catch (_) {}
     },
-    async deleteMeasurement(sensorId, name) {
-      await this.fetchJSON("DELETE", `/api/sensors/${sensorId}/measurements/${name}`);
-      await this.refreshConfig();
+    async deleteMeasurement(serverId, sensorId, name) {
+      try {
+        await this.fetchJSON(
+          "DELETE",
+          `/api/servers/${serverId}/sensors/${sensorId}/measurements/${name}`,
+        );
+        await this.refreshConfig();
+      } catch (_) {}
     },
 
-    // ---- Lifecycle ----
-    async toggleServer() {
-      const url = this.status.server.running ? "/api/server/stop" : "/api/server/start";
-      await this.fetchJSON("POST", url);
-      await this.refreshStatus();
-    },
-    async toggleSimulator() {
-      const url = this.status.simulator.running ? "/api/simulator/stop" : "/api/simulator/start";
-      await this.fetchJSON("POST", url);
-      await this.refreshStatus();
-    },
-
-    // ---- Helpers for templates ----
-    latestFor(sensorId, name) {
-      return this.latestMap[`${sensorId}:${name}`] || null;
+    // ---- Live helpers ----
+    latestFor(serverId, sensorId, name) {
+      return this.latestMap[`${serverId}:${sensorId}:${name}`] || null;
     },
     formatValue(v) {
       if (!v) return "—";
@@ -235,8 +377,14 @@ document.addEventListener("alpine:init", () => {
       const d = new Date(ts * 1000);
       return d.toLocaleTimeString();
     },
+    totalSensors() {
+      return (this.config.servers || []).reduce((acc, s) => acc + s.sensors.length, 0);
+    },
     totalMeasurements() {
-      return this.config.sensors.reduce((acc, s) => acc + s.measurements.length, 0);
+      return (this.config.servers || []).reduce(
+        (acc, s) => acc + s.sensors.reduce((a, x) => a + x.measurements.length, 0),
+        0,
+      );
     },
   }));
 });

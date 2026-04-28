@@ -34,9 +34,9 @@ from pymodbus.datastore import (
     ModbusServerContext,
     ModbusSlaveContext,
 )
-from pymodbus.server import ServerAsyncStop, StartAsyncTcpServer
+from pymodbus.server import ModbusTcpServer
 
-from models import AppConfig, RegisterType, SensorConfig
+from models import RegisterType, SensorConfig, ServerConfig
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -181,15 +181,18 @@ class EmbeddedModbusServer:
     own holding-register space.
     """
 
-    def __init__(self, config: AppConfig):
-        self.config = config
+    def __init__(self, server_config: ServerConfig):
+        self.config = server_config
         self.rules = FaultRules()
-        self.rules.reload(config.sensors)
+        self.rules.reload(server_config.sensors)
 
         # Build one slave context per unit_id (always include the default
         # so the server is reachable even with zero sensors).
-        unit_ids = sorted({s.unit_id for s in config.sensors} | {config.server.default_unit_id})
-        min_size = max(1, config.server.register_count_min)
+        unit_ids = sorted(
+            {s.unit_id for s in server_config.sensors}
+            | {server_config.default_unit_id}
+        )
+        min_size = max(1, server_config.register_count_min)
 
         # Auto-size: each (unit_id, register_type) gets max(min_size, highest_addr+1).
         all_types: Tuple[RegisterType, ...] = (
@@ -201,7 +204,7 @@ class EmbeddedModbusServer:
         per_unit_size: Dict[int, Dict[RegisterType, int]] = {
             uid: {rt: min_size for rt in all_types} for uid in unit_ids
         }
-        for s in config.sensors:
+        for s in server_config.sensors:
             for rt, r in s.address_ranges_by_type().items():
                 per_unit_size[s.unit_id][rt] = max(
                     per_unit_size[s.unit_id][rt], r.stop
@@ -234,6 +237,7 @@ class EmbeddedModbusServer:
 
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._tcp_server: Optional[ModbusTcpServer] = None
         self._running = False
         self._lock = threading.Lock()
 
@@ -250,16 +254,22 @@ class EmbeddedModbusServer:
         """Aggregate register count per unit_id (for status pills)."""
         return {uid: sum(self._sizes[uid].values()) for uid in self._sizes}
 
-    def needs_restart_for(self, config: AppConfig) -> bool:
+    def needs_restart_for(self, server_config: ServerConfig) -> bool:
         """
         True if the running server can no longer serve the new config:
+          - host or port changed
           - new unit_id appeared (or one disappeared)
           - any (unit_id, register_type) block needs to be larger than allocated
         """
-        configured = {s.unit_id for s in config.sensors} | {config.server.default_unit_id}
+        if server_config.host != self.config.host or server_config.port != self.config.port:
+            return True
+        configured = (
+            {s.unit_id for s in server_config.sensors}
+            | {server_config.default_unit_id}
+        )
         if configured != self._unit_ids:
             return True
-        for s in config.sensors:
+        for s in server_config.sensors:
             sizes_for_uid = self._sizes.get(s.unit_id)
             if sizes_for_uid is None:
                 return True
@@ -274,7 +284,7 @@ class EmbeddedModbusServer:
         with self._lock:
             if self._running:
                 return
-            cfg = self.config.server
+            cfg = self.config
             # Fail-fast: probe the listening port up-front so callers see a
             # clean RuntimeError instead of a silently dead server. Without
             # this check StartAsyncTcpServer logs a warning and returns,
@@ -323,22 +333,26 @@ class EmbeddedModbusServer:
             raise RuntimeError(f"Modbus server failed to start: {err}")
 
     async def _serve(self, ready: threading.Event) -> None:
-        cfg = self.config.server
+        cfg = self.config
         sizes = ", ".join(f"u{uid}:{size}" for uid, size in sorted(self._sizes.items()))
         logger.info(
-            f"Embedded Modbus TCP server listening on {cfg.host}:{cfg.port} "
+            f"Embedded Modbus TCP server '{cfg.id}' listening on {cfg.host}:{cfg.port} "
             f"(slaves: {sizes})"
+        )
+        # Build a per-instance ModbusTcpServer so shutdown() targets THIS
+        # listener only — the legacy ServerAsyncStop() is module-global and
+        # would tear down every running server in the process.
+        self._tcp_server = ModbusTcpServer(
+            context=self.server_context,
+            address=(cfg.host, cfg.port),
         )
         ready.set()
         try:
-            await StartAsyncTcpServer(
-                context=self.server_context,
-                address=(cfg.host, cfg.port),
-            )
+            await self._tcp_server.serve_forever()
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("Embedded Modbus TCP server stopped")
+            logger.info(f"Embedded Modbus TCP server '{cfg.id}' stopped")
 
     def stop(self) -> None:
         with self._lock:
@@ -346,16 +360,23 @@ class EmbeddedModbusServer:
                 return
             self._running = False
 
-        if self._loop and self._loop.is_running():
-            try:
-                fut = asyncio.run_coroutine_threadsafe(ServerAsyncStop(), self._loop)
-                fut.result(timeout=3.0)
-            except Exception:
-                pass
+        self._shutdown_tcp_server()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         self._thread = None
         self._loop = None
+        self._tcp_server = None
+
+    def _shutdown_tcp_server(self) -> None:
+        """Stop the per-instance ModbusTcpServer scheduled in self._loop."""
+        tcp_server = self._tcp_server
+        if tcp_server is None or self._loop is None or not self._loop.is_running():
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(tcp_server.shutdown(), self._loop)
+            fut.result(timeout=3.0)
+        except Exception as e:
+            logger.warning(f"Server '{self.config.id}' shutdown failed: {e}")
 
     def is_running(self) -> bool:
         return self._running
@@ -372,16 +393,12 @@ class EmbeddedModbusServer:
         """
         if not self._running:
             raise RuntimeError("Server is not running, cannot kick")
-        if self._loop and self._loop.is_running():
-            try:
-                fut = asyncio.run_coroutine_threadsafe(ServerAsyncStop(), self._loop)
-                fut.result(timeout=3.0)
-            except Exception as e:
-                logger.warning(f"kick: ServerAsyncStop failed: {e}")
+        self._shutdown_tcp_server()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
         self._thread = None
         self._loop = None
+        self._tcp_server = None
         with self._lock:
             self._running = False
         # Restart on the same context: registers and slaves are preserved.
