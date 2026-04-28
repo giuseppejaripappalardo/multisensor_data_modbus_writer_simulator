@@ -14,7 +14,7 @@ servers:
   label: x
   description: null
   host: 0.0.0.0
-  port: 17100
+  port: 18900
   default_unit_id: 1
   register_count_min: 16
   auto_start: false
@@ -24,9 +24,9 @@ servers:
     base_address: 0
     byte_order: big
     word_order: big
-    write_rate_seconds: 1.5
+    write_rate_seconds: 0.5
     measurements:
-    - name: temperature
+    - name: temp
       offset: 0
       register_type: holding_register
       data_type: int16
@@ -42,7 +42,7 @@ servers:
         drop_writes: false
         bit_flip_rate: 0.0
         drift_per_second: 0.0
-    - name: bool_flag_hr
+    - name: flag
       offset: 5
       register_type: holding_register
       data_type: uint16
@@ -58,27 +58,15 @@ servers:
         drop_writes: false
         bit_flip_rate: 0.0
         drift_per_second: 0.0
-    fault:
-      latency_ms: 0
-      offline: false
-      error_rate: 0.0
-      error_code: 11
-  - id: power
-    unit_id: 2
-    base_address: 100
-    byte_order: big
-    word_order: big
-    write_rate_seconds: 0.5
-    measurements:
-    - name: voltage
-      offset: 0
-      register_type: holding_register
-      data_type: float32
+    - name: motor
+      offset: 10
+      register_type: coil
+      data_type: bool
       scale: 1.0
-      min_value: 200.0
-      max_value: 250.0
+      min_value: 0.0
+      max_value: 1.0
       update_rate: 0.5
-      unit: V
+      unit: null
       fault:
         error_rate: 0.0
         error_code: 2

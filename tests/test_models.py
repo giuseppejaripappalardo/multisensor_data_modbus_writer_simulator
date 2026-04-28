@@ -200,5 +200,66 @@ class AddressOverlapTests(unittest.TestCase):
         self.assertEqual(len(cfg.sensors), 2)
 
 
+class SaturatingRangeTests(unittest.TestCase):
+    """Reject combinations of (data_type, scale, range) that would saturate."""
+
+    def test_uint16_max_saturation_rejected(self):
+        with self.assertRaisesRegex(ValidationError, "satura uint16"):
+            MeasurementConfig(name="v", offset=0, data_type=DataType.UINT16,
+                              scale=1000.0, min_value=0.0, max_value=250.0)
+
+    def test_int16_negative_saturation_rejected(self):
+        # min -50 × scale 1000 = -50000 < -32768
+        with self.assertRaisesRegex(ValidationError, "satura int16"):
+            MeasurementConfig(name="v", offset=0, data_type=DataType.INT16,
+                              scale=1000.0, min_value=-50.0, max_value=50.0)
+
+    def test_uint16_negative_min_rejected(self):
+        # min < 0 on UNSIGNED type
+        with self.assertRaisesRegex(ValidationError, "satura uint16"):
+            MeasurementConfig(name="v", offset=0, data_type=DataType.UINT16,
+                              scale=1.0, min_value=-10.0, max_value=100.0)
+
+    def test_int16_within_range_ok(self):
+        # 80 × 10 = 800 < 32767, -40 × 10 = -400 > -32768
+        m = MeasurementConfig(name="t", offset=0, data_type=DataType.INT16,
+                              scale=10.0, min_value=-40.0, max_value=80.0)
+        self.assertEqual(m.data_type, DataType.INT16)
+
+    def test_uint16_within_range_ok(self):
+        # CO2: 5000 × 1 = 5000 < 65535
+        m = MeasurementConfig(name="co2", offset=0, data_type=DataType.UINT16,
+                              scale=1.0, min_value=400.0, max_value=5000.0)
+        self.assertEqual(m.data_type, DataType.UINT16)
+
+    def test_uint32_large_range_ok(self):
+        # uptime: 4_000_000_000 × 1 < 4_294_967_295
+        m = MeasurementConfig(name="up", offset=0, data_type=DataType.UINT32,
+                              scale=1.0, min_value=0.0, max_value=4_000_000_000.0)
+        self.assertEqual(m.data_type, DataType.UINT32)
+
+    def test_float32_no_range_check(self):
+        # Floats represent any real number → no saturation check
+        m = MeasurementConfig(name="v", offset=0, data_type=DataType.FLOAT32,
+                              scale=1.0, min_value=0.0, max_value=1e9)
+        self.assertEqual(m.data_type, DataType.FLOAT32)
+
+    def test_bool_on_coil_no_range_check(self):
+        m = MeasurementConfig(name="alarm", offset=0,
+                              register_type=RegisterType.COIL,
+                              data_type=DataType.BOOL,
+                              scale=1.0, min_value=0.0, max_value=1.0)
+        self.assertEqual(m.data_type, DataType.BOOL)
+
+    def test_widening_data_type_resolves_saturation(self):
+        # Same scale and range that fails on UINT16 passes on UINT32
+        with self.assertRaises(ValidationError):
+            MeasurementConfig(name="v", offset=0, data_type=DataType.UINT16,
+                              scale=1000.0, max_value=250.0)
+        m = MeasurementConfig(name="v", offset=0, data_type=DataType.UINT32,
+                              scale=1000.0, max_value=250.0)
+        self.assertEqual(m.data_type, DataType.UINT32)
+
+
 if __name__ == "__main__":
     unittest.main()

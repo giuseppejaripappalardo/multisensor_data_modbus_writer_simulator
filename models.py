@@ -169,6 +169,47 @@ class MeasurementConfig(BaseModel):
                 self.data_type = DataType.UINT16
         return self
 
+    @model_validator(mode="after")
+    def _reject_saturating_range(self) -> "MeasurementConfig":
+        """
+        Reject combinations of (data_type, scale, min_value, max_value) that
+        would silently saturate the register at simulation time.
+
+        The encoder (simulator/encoder.py) clamps to the data_type's integer
+        range after multiplying by scale, which means out-of-range values
+        become 0xFFFF / 0x0000 / etc. without any error — clients see
+        garbage data. We catch the misconfiguration up-front instead.
+
+        Float types are skipped (FLOAT32/FLOAT64 represent any real number)
+        and bit-space types are skipped (single bit, no range concern).
+        """
+        if is_bit_space(self.register_type):
+            return self
+        int_ranges = {
+            DataType.UINT16: (0, 65_535),
+            DataType.INT16:  (-32_768, 32_767),
+            DataType.UINT32: (0, 4_294_967_295),
+            DataType.INT32:  (-2_147_483_648, 2_147_483_647),
+        }
+        if self.data_type not in int_ranges:
+            return self
+        lo, hi = int_ranges[self.data_type]
+        max_scaled = self.max_value * self.scale
+        min_scaled = self.min_value * self.scale
+        if max_scaled > hi:
+            raise ValueError(
+                f"Measurement '{self.name}': max_value {self.max_value} × scale "
+                f"{self.scale} = {max_scaled:g} satura {self.data_type.value} "
+                f"(range [{lo}, {hi}]). Riduci lo scale o usa un data_type più ampio."
+            )
+        if min_scaled < lo:
+            raise ValueError(
+                f"Measurement '{self.name}': min_value {self.min_value} × scale "
+                f"{self.scale} = {min_scaled:g} satura {self.data_type.value} "
+                f"(range [{lo}, {hi}]). Riduci lo scale o usa un data_type signed/più ampio."
+            )
+        return self
+
     @property
     def register_count(self) -> int:
         """Number of 16-bit registers used by this measurement (1 for bit types)."""

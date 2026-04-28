@@ -15,6 +15,10 @@ document.addEventListener("alpine:init", () => {
     selectedTarget: { serverId: null, sensorId: null },
     // One pending "new sensor" form per server, keyed by serverId.
     newSensorByServer: {},
+    // Per-template preview drafts, keyed by template name. Each entry holds
+    // {register_type, offset, _key} where _key encodes the current target;
+    // when the target changes, the draft is regenerated lazily.
+    templateDrafts: {},
     newServer: {
       id: "", label: "", host: "0.0.0.0", port: 5020,
       default_unit_id: 1, register_count_min: 16, auto_start: false,
@@ -242,12 +246,19 @@ document.addEventListener("alpine:init", () => {
           "POST", `/api/servers/${serverId}/sensors`, { ...draft },
         );
         await this.refreshConfig();
+        // Auto-select the newly created sensor as the catalog target so the
+        // user can immediately add measurements without an extra click.
         this.selectedTarget = { serverId, sensorId: created.id };
         const srv = this.config.servers.find(s => s.id === serverId);
         this.newSensorByServer[serverId] = this.blankNewSensor(srv);
         this.newSensorByServer[serverId].unit_id = this.suggestNextUnitId(serverId);
         this.newSensorByServer[serverId].base_address = this.suggestNextBase(serverId);
-        this.flash(`Sensore '${created.id}' creato in '${serverId}'`);
+        this.flash(`✓ Sensore '${created.id}' creato in '${serverId}' e selezionato come target del catalogo`);
+        // Scroll the new sensor into view so the user actually sees it.
+        this.$nextTick(() => {
+          const el = document.querySelector(`article.sensor.selected`);
+          if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+        });
       } catch (_) { /* flashed */ }
     },
     async patchSensor(serverId, sensorId, patch) {
@@ -291,24 +302,78 @@ document.addEventListener("alpine:init", () => {
       return this.selectedTarget.serverId === serverId
         && this.selectedTarget.sensorId === sensorId;
     },
+    // Preview/edit support for the catalog "+ add" flow.
+    // Each template has a draft (register_type + offset) shown when a sensor
+    // is selected. The user can override before clicking +.
+    _targetSensor() {
+      const srv = this.config.servers.find(s => s.id === this.selectedTarget.serverId);
+      return srv && srv.sensors.find(s => s.id === this.selectedTarget.sensorId);
+    },
+    ensureDraft(t) {
+      const targetKey = `${this.selectedTarget.serverId}:${this.selectedTarget.sensorId}`;
+      const cached = this.templateDrafts[t.name];
+      if (cached && cached._key === targetKey) return cached;
+      const sensor = this._targetSensor();
+      const draft = {
+        register_type: t.register_type,
+        offset: sensor ? this.nextOffset(sensor, t.register_type) : 0,
+        _key: targetKey,
+      };
+      this.templateDrafts[t.name] = draft;
+      return draft;
+    },
+    onDraftRtChange(t, rt) {
+      const draft = this.ensureDraft(t);
+      draft.register_type = rt;
+      // Recompute next-free offset for the new register_type space.
+      const sensor = this._targetSensor();
+      if (sensor) draft.offset = this.nextOffset(sensor, rt);
+    },
+    previewAddress(t) {
+      const sensor = this._targetSensor();
+      if (!sensor) return null;
+      const draft = this.ensureDraft(t);
+      return sensor.base_address + draft.offset;
+    },
+    previewAddressText(t) {
+      const sensor = this._targetSensor();
+      if (!sensor) return "";
+      const draft = this.ensureDraft(t);
+      const abs = sensor.base_address + draft.offset;
+      const space = this.rtLabel(draft.register_type);
+      return `→ ${space} address ${abs} (base ${sensor.base_address} + offset ${draft.offset})`;
+    },
+    targetServerLocked() {
+      return this.selectedTarget.serverId
+        ? this.isLocked(this.selectedTarget.serverId)
+        : false;
+    },
     async addMeasurementFromTemplate(t) {
       const { serverId, sensorId } = this.selectedTarget;
       if (!serverId || !sensorId) {
         this.flash("Seleziona prima un sensore (cliccando sull'header)");
         return;
       }
-      const srv = this.config.servers.find(s => s.id === serverId);
-      const sensor = srv && srv.sensors.find(s => s.id === sensorId);
+      const sensor = this._targetSensor();
       if (!sensor) return;
-      const next = this.nextOffset(sensor, t.register_type);
+      const draft = this.ensureDraft(t);
       try {
         await this.fetchJSON(
           "POST",
           `/api/servers/${serverId}/sensors/${sensorId}/measurements`,
-          { template_name: t.name, offset: next },
+          {
+            template_name: t.name,
+            offset: draft.offset,
+            register_type: draft.register_type,
+          },
         );
         await this.refreshConfig();
-        this.flash(`Aggiunta '${t.label}' a ${serverId}/${sensorId}`);
+        this.flash(
+          `Aggiunta '${t.label}' a ${serverId}/${sensorId} ` +
+          `@ ${this.rtLabel(draft.register_type)} ${sensor.base_address + draft.offset}`,
+        );
+        // Reset draft so the next "+ add" recomputes next-free for this template.
+        delete this.templateDrafts[t.name];
       } catch (_) {}
     },
     nextOffset(sensor, registerType) {
@@ -334,6 +399,51 @@ document.addEventListener("alpine:init", () => {
         case "float64": return 4;
         default: return 1;
       }
+    },
+    // Returns a list of warning strings for a measurement whose current
+    // (data_type, scale, min_value, max_value) combination would silently
+    // lose precision or saturate the register at simulation time. Empty if
+    // everything is consistent.
+    measurementWarnings(m) {
+      const warnings = [];
+      const intRanges = {
+        uint16: [0, 65535],
+        int16:  [-32768, 32767],
+        uint32: [0, 4294967295],
+        int32:  [-2147483648, 2147483647],
+      };
+      const isInt = m.data_type in intRanges;
+      const isFloat = m.data_type === "float32" || m.data_type === "float64";
+      const scale = +m.scale || 1;
+      const minV = +m.min_value;
+      const maxV = +m.max_value;
+
+      if (isInt) {
+        const [lo, hi] = intRanges[m.data_type];
+        // Saturazione max
+        if (Number.isFinite(maxV) && maxV * scale > hi) {
+          warnings.push(`max ${maxV} × scale ${scale} = ${(maxV*scale).toLocaleString()} → satura ${m.data_type} a ${hi}`);
+        }
+        // Saturazione min (per signed e per unsigned con valori negativi)
+        if (Number.isFinite(minV) && minV * scale < lo) {
+          warnings.push(`min ${minV} × scale ${scale} = ${(minV*scale).toLocaleString()} → satura ${m.data_type} a ${lo}`);
+        }
+        // Perdita di decimali: il range è "non-intero" e scale=1
+        const rangeIsNonInteger =
+          (Number.isFinite(maxV) && Math.abs(maxV - Math.round(maxV)) > 1e-9) ||
+          (Number.isFinite(minV) && Math.abs(minV - Math.round(minV)) > 1e-9);
+        if (scale === 1 && rangeIsNonInteger) {
+          warnings.push(`scale=1 su ${m.data_type}: i decimali del valore generato vengono persi (round)`);
+        }
+        // Range troppo piccolo: max-min < 2 → praticamente solo 1-2 valori distinti
+        if (scale === 1 && Number.isFinite(maxV) && Number.isFinite(minV) && (maxV - minV) < 2 && (maxV - minV) > 0) {
+          warnings.push(`range [${minV}..${maxV}] con scale=1 su ${m.data_type}: solo ${Math.floor(maxV)-Math.ceil(minV)+1} valori distinti possibili`);
+        }
+      }
+      if (isFloat && scale !== 1) {
+        warnings.push(`scale ${scale} su ${m.data_type}: scale ≠ 1 sui float è inusuale (il client deve dividere; di solito si lascia 1)`);
+      }
+      return warnings;
     },
     async patchMeasurement(serverId, sensorId, name, patch) {
       try {

@@ -27,15 +27,23 @@
       <!-- LEFT: Catalog -->
       <aside class="catalog">
         <h2>Catalogo misure</h2>
-        <p class="hint">
-          Seleziona un sensore (clicca sull'header) e poi
-          aggiungi una misura dal catalogo.
-        </p>
-        <p class="hint" x-show="selectedTarget.sensorId">
-          Target:
-          <strong x-text="selectedTarget.serverId"></strong> /
-          <strong x-text="selectedTarget.sensorId"></strong>
-        </p>
+        <div class="target-banner" :class="{ active: selectedTarget.sensorId }">
+          <template x-if="!selectedTarget.sensorId">
+            <small>
+              <strong>Nessun sensore selezionato.</strong><br>
+              Clicca <em>"Seleziona come target"</em> sulla card di un sensore per
+              indirizzarci le misure aggiunte dal catalogo.
+            </small>
+          </template>
+          <template x-if="selectedTarget.sensorId">
+            <small>
+              Target attivo:
+              <strong x-text="selectedTarget.serverId"></strong>
+              <span>/</span>
+              <strong x-text="selectedTarget.sensorId"></strong>
+            </small>
+          </template>
+        </div>
         <ul>
           <template x-for="t in catalog" :key="t.name">
             <li class="cat-item">
@@ -47,8 +55,32 @@
                 <span x-text="t.unit || '—'"></span> · scale <span x-text="t.scale"></span> · <span x-text="t.register_count"></span> reg
               </div>
               <small x-text="t.description"></small>
+
+              <!-- Preview + edit del posizionamento, visibile solo quando un sensore è selezionato -->
+              <div class="cat-preview" x-show="selectedTarget.sensorId">
+                <div class="cat-preview-row">
+                  <label class="cat-preview-field" title="Spazio Modbus dove scrivere la misura. I 4 spazi sono indipendenti.">
+                    <span>Spazio</span>
+                    <select :disabled="targetServerLocked()"
+                            :value="ensureDraft(t).register_type"
+                            @change="onDraftRtChange(t, $event.target.value)">
+                      <template x-for="rt in registerTypes" :key="rt">
+                        <option :value="rt" x-text="rtLabel(rt)"></option>
+                      </template>
+                    </select>
+                  </label>
+                  <label class="cat-preview-field" title="Offset relativo al base_address del sensore. Auto-calcolato come 'primo slot libero' nello spazio scelto.">
+                    <span>Offset</span>
+                    <input type="number" min="0"
+                           :disabled="targetServerLocked()"
+                           x-model.number="ensureDraft(t).offset" />
+                  </label>
+                </div>
+                <small class="cat-preview-addr" x-text="previewAddressText(t)"></small>
+              </div>
+
               <button class="btn small"
-                      :disabled="!selectedTarget.sensorId || isLocked(selectedTarget.serverId)"
+                      :disabled="!selectedTarget.sensorId || targetServerLocked()"
                       @click="addMeasurementFromTemplate(t)">
                 + Aggiungi al sensore selezionato
               </button>
@@ -212,14 +244,16 @@
                   Server in esecuzione: ferma il server per aggiungere o rimuovere sensori.
                 </p>
                 <div class="form-grid"
-                     x-data="{ d: newSensorByServer[srv.id] }"
                      :class="{ disabled: isLocked(srv.id) }">
                   <label class="form-field">
                     <span>ID sensore <em>*</em></span>
                     <input :disabled="isLocked(srv.id)"
                            x-model="newSensorByServer[srv.id].id"
                            placeholder="es. office_aq"
-                           title="Identificatore univoco entro questo server (può ripetersi tra server diversi)." />
+                           title="Identificatore univoco entro questo server (può ripetersi tra server diversi). Obbligatorio." />
+                    <small class="form-help" x-show="!newSensorByServer[srv.id]?.id?.trim()">
+                      Inserisci un ID per abilitare il bottone
+                    </small>
                   </label>
                   <label class="form-field">
                     <span>Unit ID (slave)</span>
@@ -262,7 +296,7 @@
                   </label>
                   <div class="form-field actions">
                     <button class="btn primary"
-                            :disabled="isLocked(srv.id)"
+                            :disabled="isLocked(srv.id) || !newSensorByServer[srv.id]?.id?.trim()"
                             @click="createSensor(srv.id)">
                       + Sensore
                     </button>
@@ -272,15 +306,24 @@
 
               <!-- Sensor list -->
               <template x-if="srv.sensors.length === 0">
-                <div class="empty">Nessun sensore in questo server.</div>
+                <div class="empty">
+                  <strong>Nessun sensore in questo server.</strong><br>
+                  <small>Compila l'ID nel form sopra e clicca <em>+ Sensore</em>.</small>
+                </div>
               </template>
 
               <template x-for="s in srv.sensors" :key="s.id">
                 <article class="sensor"
                          :class="{ selected: isTargetSelected(srv.id, s.id) }">
-                  <header @click="selectTarget(srv.id, s.id)">
-                    <div>
-                      <h4 x-text="s.id"></h4>
+                  <header>
+                    <div class="sensor-title">
+                      <h4>
+                        <span x-text="s.id"></span>
+                        <span class="target-badge" x-show="isTargetSelected(srv.id, s.id)"
+                              title="Questo è il sensore target del catalogo: le misure aggiunte dal catalogo finiranno qui.">
+                          ✓ Target
+                        </span>
+                      </h4>
                       <small>
                         unit <strong x-text="s.unit_id"></strong>
                         · base <strong x-text="s.base_address"></strong>
@@ -290,11 +333,21 @@
                         · <span x-text="s.measurements.length"></span> misure
                       </small>
                     </div>
-                    <button class="btn danger small"
-                            :disabled="isLocked(srv.id)"
-                            @click.stop="deleteSensor(srv.id, s.id)">
-                      elimina
-                    </button>
+                    <div class="sensor-actions">
+                      <button class="btn small"
+                              :class="{ primary: !isTargetSelected(srv.id, s.id) }"
+                              @click="selectTarget(srv.id, s.id)"
+                              :disabled="isTargetSelected(srv.id, s.id)"
+                              title="Imposta questo sensore come target per il catalogo. Le misure aggiunte dal catalogo finiranno qui.">
+                        <span x-show="!isTargetSelected(srv.id, s.id)">Seleziona come target</span>
+                        <span x-show="isTargetSelected(srv.id, s.id)">Selezionato</span>
+                      </button>
+                      <button class="btn danger small"
+                              :disabled="isLocked(srv.id)"
+                              @click.stop="deleteSensor(srv.id, s.id)">
+                        Elimina
+                      </button>
+                    </div>
                   </header>
 
                   <div class="sensor-body">
@@ -381,8 +434,17 @@
                       </thead>
                       <tbody>
                         <template x-for="m in s.measurements" :key="m.name">
-                          <tr>
-                            <td><strong x-text="m.name"></strong><br /><small x-text="m.unit || ''"></small></td>
+                          <tr :class="{ 'has-warnings': measurementWarnings(m).length > 0 }">
+                            <td>
+                              <strong x-text="m.name"></strong><br />
+                              <small x-text="m.unit || ''"></small>
+                              <template x-if="measurementWarnings(m).length > 0">
+                                <span class="warn-badge"
+                                      :title="measurementWarnings(m).join('\n')">
+                                  ⚠ <span x-text="measurementWarnings(m).length"></span>
+                                </span>
+                              </template>
+                            </td>
                             <td>
                               <input type="number" min="0" :value="m.offset"
                                      :disabled="isLocked(srv.id)"
@@ -452,6 +514,17 @@
                               </button>
                             </td>
                           </tr>
+                          <template x-if="measurementWarnings(m).length > 0">
+                            <tr class="warning-row">
+                              <td colspan="10">
+                                <ul class="warning-list">
+                                  <template x-for="w in measurementWarnings(m)" :key="w">
+                                    <li x-text="w"></li>
+                                  </template>
+                                </ul>
+                              </td>
+                            </tr>
+                          </template>
                         </template>
                       </tbody>
                     </table>
