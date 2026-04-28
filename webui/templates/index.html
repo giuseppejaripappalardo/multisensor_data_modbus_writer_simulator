@@ -155,6 +155,7 @@
                   <tr>
                     <th>Nome</th>
                     <th>Offset</th>
+                    <th title="Modbus address space">Spazio</th>
                     <th>Tipo</th>
                     <th>Scale</th>
                     <th>Range</th>
@@ -173,7 +174,16 @@
                                @change="patchMeasurement(s.id, m.name, { offset: +$event.target.value })" />
                       </td>
                       <td>
+                        <select :value="m.register_type"
+                                @change="patchMeasurement(s.id, m.name, { register_type: $event.target.value })">
+                          <template x-for="rt in registerTypes" :key="rt">
+                            <option :value="rt" x-text="rtLabel(rt)"></option>
+                          </template>
+                        </select>
+                      </td>
+                      <td>
                         <select :value="m.data_type"
+                                :disabled="isBitSpace(m.register_type)"
                                 @change="patchMeasurement(s.id, m.name, { data_type: $event.target.value })">
                           <template x-for="dt in dataTypes" :key="dt"><option :value="dt" x-text="dt"></option></template>
                         </select>
@@ -278,34 +288,43 @@
       <div x-show="dumpOpen" class="dump-body">
         <template x-for="slave in slaves" :key="slave.unit_id">
           <div class="slave">
-            <h3>Unit ID <span x-text="slave.unit_id"></span> · <small x-text="slave.size + ' registri'"></small></h3>
-            <table class="reg-table">
-              <thead>
-                <tr>
-                  <th>Addr</th>
-                  <th>Hex</th>
-                  <th>Dec</th>
-                  <th>Sensore / Misura</th>
-                </tr>
-              </thead>
-              <tbody>
-                <template x-for="(value, addr) in slave.registers" :key="addr">
-                  <tr :class="{ 'has-owner': addressOwner(slave, addr) }">
-                    <td x-text="addr"></td>
-                    <td class="hex" x-text="'0x' + value.toString(16).padStart(4, '0').toUpperCase()"></td>
-                    <td x-text="value"></td>
-                    <td>
-                      <template x-if="addressOwner(slave, addr)">
-                        <span>
-                          <strong x-text="addressOwner(slave, addr).sensorId + '.' + addressOwner(slave, addr).measurementName"></strong>
-                          <small x-text="addressOwner(slave, addr).hint"></small>
-                        </span>
-                      </template>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
+            <h3>Unit ID <span x-text="slave.unit_id"></span></h3>
+            <template x-for="space in slave.spaces" :key="space.register_type">
+              <div class="space">
+                <h4>
+                  <span x-text="rtLabel(space.register_type)"></span>
+                  <small x-text="'(' + space.register_type + ', ' + space.size + ' addr)'"></small>
+                </h4>
+                <table class="reg-table">
+                  <thead>
+                    <tr>
+                      <th>Addr</th>
+                      <th x-show="!isBitSpace(space.register_type)">Hex</th>
+                      <th>Dec</th>
+                      <th>Sensore / Misura</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="(value, addr) in space.registers" :key="addr">
+                      <tr :class="{ 'has-owner': addressOwner(slave, space, addr) }">
+                        <td x-text="addr"></td>
+                        <td class="hex" x-show="!isBitSpace(space.register_type)"
+                            x-text="'0x' + value.toString(16).padStart(4, '0').toUpperCase()"></td>
+                        <td x-text="value"></td>
+                        <td>
+                          <template x-if="addressOwner(slave, space, addr)">
+                            <span>
+                              <strong x-text="addressOwner(slave, space, addr).sensorId + '.' + addressOwner(slave, space, addr).measurementName"></strong>
+                              <small x-text="addressOwner(slave, space, addr).hint"></small>
+                            </span>
+                          </template>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </table>
+              </div>
+            </template>
           </div>
         </template>
       </div>

@@ -2,6 +2,7 @@ document.addEventListener("alpine:init", () => {
   Alpine.data("simApp", () => ({
     catalog: [],
     dataTypes: [],
+    registerTypes: [],
     config: { sensors: [], modbus: {}, server: {} },
     status: {
       server: { running: false, host: "-", port: 0, unit_id: 0 },
@@ -49,6 +50,9 @@ document.addEventListener("alpine:init", () => {
       const c = await this.fetchJSON("GET", "/api/catalog");
       this.catalog = c.templates;
       this.dataTypes = c.data_types;
+      this.registerTypes = c.register_types || [
+        "coil", "discrete_input", "input_register", "holding_register",
+      ];
     },
     async refreshConfig() {
       this.config = await this.fetchJSON("GET", "/api/config");
@@ -77,20 +81,36 @@ document.addEventListener("alpine:init", () => {
       if (this.dumpOpen) await this.refreshStatus();
     },
 
-    addressOwner(slave, addr) {
+    addressOwner(slave, space, addr) {
+      const rt = space.register_type;
       for (const s of slave.sensors) {
         for (const m of s.measurements) {
+          if (m.register_type !== rt) continue;
           if (addr >= m.address && addr < m.address + m.register_count) {
             const idx = addr - m.address;
             const total = m.register_count;
             const hint = total > 1
               ? `[${idx + 1}/${total}] ${m.data_type}`
-              : `${m.data_type} · scale=${m.scale}${m.unit ? ' · ' + m.unit : ''}`;
+              : `${m.data_type}${m.scale !== 1 ? ' · scale=' + m.scale : ''}${m.unit ? ' · ' + m.unit : ''}`;
             return { sensorId: s.id, measurementName: m.name, hint };
           }
         }
       }
       return null;
+    },
+
+    isBitSpace(rt) {
+      return rt === "coil" || rt === "discrete_input";
+    },
+
+    rtLabel(rt) {
+      const map = {
+        coil: "Coil",
+        discrete_input: "Discrete Input",
+        input_register: "Input Register",
+        holding_register: "Holding Register",
+      };
+      return map[rt] || rt;
     },
 
     // ---- Sensor ops ----
@@ -136,7 +156,7 @@ document.addEventListener("alpine:init", () => {
         return;
       }
       const sensor = this.config.sensors.find((s) => s.id === this.selectedSensorId);
-      const next = this.nextOffset(sensor);
+      const next = this.nextOffset(sensor, t.register_type);
       try {
         await this.fetchJSON("POST", `/api/sensors/${sensor.id}/measurements`, {
           template_name: t.name,
@@ -146,10 +166,16 @@ document.addEventListener("alpine:init", () => {
         this.flash(`Aggiunta '${t.label}' al sensore ${sensor.id}`);
       } catch (e) { /* already flashed */ }
     },
-    nextOffset(sensor) {
-      if (!sensor || sensor.measurements.length === 0) return 0;
+    nextOffset(sensor, registerType) {
+      // Each address space has its own offsets — only consider measurements
+      // that share the same register_type.
+      if (!sensor) return 0;
+      const same = sensor.measurements.filter(
+        (m) => !registerType || m.register_type === registerType,
+      );
+      if (same.length === 0) return 0;
       let max = 0;
-      for (const m of sensor.measurements) {
+      for (const m of same) {
         const regs = this.regCount(m.data_type);
         max = Math.max(max, m.offset + regs);
       }

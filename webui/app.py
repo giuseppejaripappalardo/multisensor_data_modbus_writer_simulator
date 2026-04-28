@@ -23,6 +23,7 @@ from models import (
     DataType,
     MeasurementConfig,
     MeasurementFault,
+    RegisterType,
     SensorConfig,
     SensorFault,
     REGISTERS_PER_TYPE,
@@ -85,6 +86,7 @@ class MeasurementCreate(BaseModel):
     template_name: Optional[str] = None        # if set, prefill from catalog
     name: Optional[str] = None
     offset: int
+    register_type: Optional[RegisterType] = None
     data_type: Optional[DataType] = None
     scale: Optional[float] = None
     min_value: Optional[float] = None
@@ -95,6 +97,7 @@ class MeasurementCreate(BaseModel):
 
 class MeasurementUpdate(BaseModel):
     offset: Optional[int] = None
+    register_type: Optional[RegisterType] = None
     data_type: Optional[DataType] = None
     scale: Optional[float] = None
     min_value: Optional[float] = None
@@ -161,7 +164,11 @@ def catalog():
             **t.model_dump(),
             "register_count": REGISTERS_PER_TYPE[t.data_type],
         })
-    return {"templates": items, "data_types": [d.value for d in DataType]}
+    return {
+        "templates": items,
+        "data_types": [d.value for d in DataType],
+        "register_types": [r.value for r in RegisterType],
+    }
 
 
 # ---- Config (full read/write) -------------------------------------------
@@ -246,15 +253,18 @@ def create_measurement(sensor_id: str, payload: MeasurementCreate):
     })
 
     measurement = MeasurementConfig(**base)
-    # Overlap sanity check.
+    # Overlap sanity check — only against measurements in the *same*
+    # register_type address space (coil 0 and holding 0 are independent).
     end = measurement.offset + measurement.register_count - 1
     for m in sensor.measurements:
+        if m.register_type != measurement.register_type:
+            continue
         m_end = m.offset + m.register_count - 1
         if m.offset <= end and measurement.offset <= m_end:
             raise HTTPException(
                 status_code=409,
-                detail=f"Address overlap with measurement '{m.name}' "
-                       f"({m.offset}..{m_end})",
+                detail=f"Address overlap with '{m.name}' "
+                       f"({m.register_type.value} {m.offset}..{m_end})",
             )
     sensor.measurements.append(measurement)
     _replace(cfg)
@@ -272,6 +282,24 @@ def update_measurement(sensor_id: str, name: str, patch: MeasurementUpdate):
     # models in pydantic v2 -> they would silently remain plain dicts).
     merged = {**m.model_dump(), **updates}
     new_m = MeasurementConfig(**merged)
+
+    # Overlap check after the patch — only against measurements in the
+    # same register_type address space (changing offset / register_type /
+    # data_type can introduce overlaps).
+    new_end = new_m.offset + new_m.register_count - 1
+    for x in sensor.measurements:
+        if x.name == name:
+            continue
+        if x.register_type != new_m.register_type:
+            continue
+        x_end = x.offset + x.register_count - 1
+        if x.offset <= new_end and new_m.offset <= x_end:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Address overlap with '{x.name}' "
+                       f"({x.register_type.value} {x.offset}..{x_end})",
+            )
+
     sensor.measurements = [new_m if x.name == name else x for x in sensor.measurements]
     _replace(cfg)
     return new_m.model_dump(mode="json")
@@ -284,6 +312,34 @@ def delete_measurement(sensor_id: str, name: str):
     sensor.measurements = [m for m in sensor.measurements if m.name != name]
     _replace(cfg)
     return {"deleted": name}
+
+
+class SpikeRequest(BaseModel):
+    value: float
+    duration_seconds: float = Field(gt=0)
+
+
+@app.post("/api/sensors/{sensor_id}/measurements/{name}/spike")
+def inject_spike(sensor_id: str, name: str, payload: SpikeRequest):
+    """One-shot value override: replace the generated value for N seconds."""
+    sensor = _find_sensor(runtime.config, sensor_id)
+    _find_measurement(sensor, name)  # 404 if missing
+    try:
+        runtime.inject_spike(sensor_id, name, payload.value, payload.duration_seconds)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    return {
+        "sensor_id": sensor_id,
+        "name": name,
+        "value": payload.value,
+        "duration_seconds": payload.duration_seconds,
+    }
+
+
+@app.delete("/api/sensors/{sensor_id}/measurements/{name}/spike")
+def clear_spike(sensor_id: str, name: str):
+    cleared = runtime.clear_spike(sensor_id, name)
+    return {"cleared": cleared}
 
 
 # ---- Lifecycle controls --------------------------------------------------
@@ -300,6 +356,16 @@ def server_start():
 @app.post("/api/server/stop")
 def server_stop():
     runtime.stop_server()
+    return runtime.server_status()
+
+
+@app.post("/api/server/kick")
+def server_kick():
+    """Drop all active TCP connections; clients will receive a close/RST."""
+    try:
+        runtime.kick_clients()
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     return runtime.server_status()
 
 

@@ -8,21 +8,40 @@ Writes go to a RegisterSink, which can be:
 The simulator runs as a daemon thread (start/stop are non-blocking) so the
 web UI and the CLI share the same engine.
 """
+import random
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
-from models import AppConfig, MeasurementConfig, SensorConfig
+from models import AppConfig, MeasurementConfig, RegisterType, SensorConfig, is_bit_space
 from simulator.encoder import decode_value, encode_value
 from simulator.generator import SensorGenerator
+from utils.clamp import clamp
 from utils.logging import get_logger
+
+
+@dataclass
+class _SpikeOverride:
+    """One-shot value injection: replaces the generated value until expires_at."""
+    value: float
+    expires_at: float
 
 logger = get_logger(__name__)
 
 
 class RegisterSink(Protocol):
-    """Anything that can accept a contiguous block of holding-register writes."""
-    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool: ...
+    """
+    Anything that can accept writes to one of the four Modbus address spaces.
+
+    The simulator partitions writes by (unit_id, register_type) and submits
+    one call per partition. Each call carries an address->value map for that
+    partition; the sink is responsible for grouping into contiguous blocks.
+    """
+    def write_register_blocks(
+        self, unit_id: int, register_type: RegisterType,
+        registers: Dict[int, int],
+    ) -> bool: ...
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +49,7 @@ class RegisterSink(Protocol):
 # ---------------------------------------------------------------------------
 
 class ModbusClientSink:
-    """Adapter: forward writes to a remote Modbus TCP slave."""
+    """Adapter: forward writes to a remote Modbus TCP slave (legacy CLI)."""
 
     def __init__(self, modbus_client):
         self._client = modbus_client
@@ -41,9 +60,20 @@ class ModbusClientSink:
     def disconnect(self) -> None:
         self._client.disconnect()
 
-    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool:
-        # Legacy ModbusClient.write_register_blocks doesn't take unit_id per call;
-        # it uses the one in its config. Pass through unchanged.
+    def write_register_blocks(
+        self, unit_id: int, register_type: RegisterType,
+        registers: Dict[int, int],
+    ) -> bool:
+        # The legacy ModbusClient only writes holding registers via FC 16.
+        # Coil / DI / IR writes have no equivalent over Modbus TCP from a
+        # client (they would require non-standard extensions). We log and
+        # drop them.
+        if register_type != RegisterType.HOLDING_REGISTER:
+            logger.warning(
+                f"ModbusClientSink: dropping {register_type.value} write "
+                f"(legacy client only supports holding registers)."
+            )
+            return True
         return self._client.write_register_blocks(registers)
 
 
@@ -59,7 +89,10 @@ class EmbeddedServerSink:
     def disconnect(self) -> None:
         pass
 
-    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool:
+    def write_register_blocks(
+        self, unit_id: int, register_type: RegisterType,
+        registers: Dict[int, int],
+    ) -> bool:
         if not registers:
             return True
         sorted_addrs = sorted(registers.keys())
@@ -70,11 +103,11 @@ class EmbeddedServerSink:
             if addr == expected:
                 block.append(registers[addr])
             else:
-                self._server.write_holding(unit_id, start, block)
+                self._server.write_block(unit_id, register_type, start, block)
                 start = addr
                 block = [registers[addr]]
             expected = addr + 1
-        self._server.write_holding(unit_id, start, block)
+        self._server.write_block(unit_id, register_type, start, block)
         return True
 
 
@@ -108,6 +141,12 @@ class SensorSimulator:
         self._generators: Dict[str, SensorGenerator] = {}
         self._last_update: Dict[str, Dict[str, float]] = {}
         self._frozen_values: Dict[str, Dict[str, float]] = {}
+        # drift accumulator: total real-units offset applied so far per measurement
+        self._drift: Dict[str, Dict[str, float]] = {}
+        # one-shot spike overrides keyed (sensor_id, measurement_name)
+        self._spikes: Dict[Tuple[str, str], _SpikeOverride] = {}
+        self._spike_lock = threading.Lock()
+        self._rng = random.Random()
         self._reset_state()
 
     # --- lifecycle ---------------------------------------------------
@@ -164,13 +203,45 @@ class SensorSimulator:
         gens: Dict[str, SensorGenerator] = {}
         last: Dict[str, Dict[str, float]] = {}
         frozen: Dict[str, Dict[str, float]] = {}
+        drift: Dict[str, Dict[str, float]] = {}
         for sensor in self.config.sensors:
             gens[sensor.id] = SensorGenerator(sensor.id, sensor.measurements)
             last[sensor.id] = {m.name: -float("inf") for m in sensor.measurements}
             frozen[sensor.id] = {}
+            drift[sensor.id] = {m.name: 0.0 for m in sensor.measurements}
         self._generators = gens
         self._last_update = last
         self._frozen_values = frozen
+        self._drift = drift
+
+    # --- one-shot fault injection --------------------------------------
+
+    def inject_spike(
+        self, sensor_id: str, measurement_name: str,
+        value: float, duration_seconds: float,
+    ) -> None:
+        """Replace the generated value with `value` for the next duration_seconds."""
+        if duration_seconds <= 0:
+            raise ValueError("duration_seconds must be > 0")
+        expires = time.time() + duration_seconds
+        with self._spike_lock:
+            self._spikes[(sensor_id, measurement_name)] = _SpikeOverride(
+                value=float(value), expires_at=expires,
+            )
+
+    def clear_spike(self, sensor_id: str, measurement_name: str) -> bool:
+        with self._spike_lock:
+            return self._spikes.pop((sensor_id, measurement_name), None) is not None
+
+    def _active_spike(self, sensor_id: str, measurement_name: str) -> Optional[float]:
+        with self._spike_lock:
+            spike = self._spikes.get((sensor_id, measurement_name))
+            if spike is None:
+                return None
+            if time.time() >= spike.expires_at:
+                del self._spikes[(sensor_id, measurement_name)]
+                return None
+            return spike.value
 
     # --- internal ----------------------------------------------------
 
@@ -204,8 +275,10 @@ class SensorSimulator:
         generator = self._generators[sensor_id]
         last_updates = self._last_update[sensor_id]
         frozen_values = self._frozen_values[sensor_id]
+        drift_state = self._drift.setdefault(sensor_id, {})
 
-        register_map: Dict[int, int] = {}
+        # One write map per register_type (coil / DI / IR / HR).
+        register_maps: Dict[RegisterType, Dict[int, int]] = {}
         updates: List[dict] = []
 
         # Effective rate is the slower of the measurement-level rate and the
@@ -221,41 +294,80 @@ class SensorSimulator:
             last_updates[measurement.name] = sim_time
 
             # Compute the value:
+            #   - spike active  -> override with the injected value
             #   - frozen=True   -> reuse last value (or generate one once if missing)
             #   - drop_writes   -> compute a value for the UI but skip the write
-            if measurement.fault.frozen and measurement.name in frozen_values:
+            spike = self._active_spike(sensor_id, measurement.name)
+            if spike is not None:
+                raw = spike
+                frozen_values[measurement.name] = raw
+            elif measurement.fault.frozen and measurement.name in frozen_values:
                 raw = frozen_values[measurement.name]
             else:
                 raw = generator.generate(measurement.name, sim_time)
+                # Apply drift (cumulative real-units offset) and clamp to range.
+                if measurement.fault.drift_per_second != 0.0:
+                    delta = measurement.fault.drift_per_second * (sim_time - last) \
+                        if last != -float("inf") else 0.0
+                    drift_state[measurement.name] = drift_state.get(measurement.name, 0.0) + delta
+                    raw = clamp(raw + drift_state[measurement.name],
+                                measurement.min_value, measurement.max_value)
                 frozen_values[measurement.name] = raw
 
-            regs = encode_value(
-                raw,
-                measurement.data_type,
-                measurement.scale,
-                measurement.min_value,
-                measurement.max_value,
-                sensor.byte_order,
-                sensor.word_order,
-            )
-            try:
-                roundtrip = decode_value(
-                    regs, measurement.data_type, scale=measurement.scale,
-                    byte_order=sensor.byte_order, word_order=sensor.word_order,
+            # Encoder bypass for bit-spaces: coil and discrete input store
+            # a single 0/1 value. We treat the generated value as a boolean:
+            # !=0 -> 1, 0 (or close to 0) -> 0. Scale is informational.
+            if is_bit_space(measurement.register_type):
+                bit_value = 0 if abs(raw) < 0.5 else 1
+                regs = [bit_value]
+                # Bit-flip on a coil simply toggles the bit.
+                if measurement.fault.bit_flip_rate > 0 and \
+                        self._rng.random() < measurement.fault.bit_flip_rate:
+                    regs = [1 - regs[0]]
+            else:
+                regs = encode_value(
+                    raw,
+                    measurement.data_type,
+                    measurement.scale,
+                    measurement.min_value,
+                    measurement.max_value,
+                    sensor.byte_order,
+                    sensor.word_order,
                 )
-            except Exception:
-                roundtrip = float("nan")
+
+                # Bit-flip injection: with bit_flip_rate probability, flip one
+                # random bit somewhere in the encoded payload.
+                if measurement.fault.bit_flip_rate > 0 and \
+                        self._rng.random() < measurement.fault.bit_flip_rate:
+                    total_bits = 16 * len(regs)
+                    bit = self._rng.randrange(total_bits)
+                    reg_idx = bit // 16
+                    bit_idx = bit % 16
+                    regs = list(regs)
+                    regs[reg_idx] = (regs[reg_idx] ^ (1 << bit_idx)) & 0xFFFF
+            if is_bit_space(measurement.register_type):
+                roundtrip = float(regs[0])
+            else:
+                try:
+                    roundtrip = decode_value(
+                        regs, measurement.data_type, scale=measurement.scale,
+                        byte_order=sensor.byte_order, word_order=sensor.word_order,
+                    )
+                except Exception:
+                    roundtrip = float("nan")
 
             base_addr = sensor.base_address + measurement.offset
             if not measurement.fault.drop_writes:
+                bucket = register_maps.setdefault(measurement.register_type, {})
                 for i, val in enumerate(regs):
-                    register_map[base_addr + i] = val
+                    bucket[base_addr + i] = val
 
             updates.append({
                 "name": measurement.name,
                 "raw": raw,
                 "scaled": raw * measurement.scale,
                 "data_type": measurement.data_type.value,
+                "register_type": measurement.register_type.value,
                 "address": base_addr,
                 "regs": regs,
                 "hex": "".join(f"{r:04x}" for r in regs),
@@ -267,14 +379,16 @@ class SensorSimulator:
                 "dropped": bool(measurement.fault.drop_writes),
             })
 
-        if register_map:
+        for rt, register_map in register_maps.items():
+            if not register_map:
+                continue
             try:
-                ok = self.sink.write_register_blocks(sensor.unit_id, register_map)
+                ok = self.sink.write_register_blocks(sensor.unit_id, rt, register_map)
             except Exception as e:
-                logger.error(f"[{sensor_id}] write failed: {e}")
+                logger.error(f"[{sensor_id}/{rt.value}] write failed: {e}")
                 ok = False
             if not ok:
-                logger.warning(f"[{sensor_id}] sink write returned False")
+                logger.warning(f"[{sensor_id}/{rt.value}] sink write returned False")
 
         if updates and self.on_update:
             try:

@@ -6,22 +6,44 @@ plus fault-injection (latency, per-measurement and per-sensor errors) for
 realistic testing of clients.
 """
 from enum import Enum
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class DataType(str, Enum):
-    """Supported Modbus data types."""
+    """Supported Modbus data types (for register-based measurements)."""
     UINT16 = "uint16"
     INT16 = "int16"
     UINT32 = "uint32"
     INT32 = "int32"
     FLOAT32 = "float32"
     FLOAT64 = "float64"
+    BOOL = "bool"  # Single bit; only valid for COIL / DISCRETE_INPUT
+
+
+class RegisterType(str, Enum):
+    """
+    Modbus address spaces.
+
+    Each space is independently addressed:
+      - COIL              -> 1 bit, R/W (FC 01 read, FC 05/15 write)
+      - DISCRETE_INPUT    -> 1 bit, R/O (FC 02 read)
+      - INPUT_REGISTER    -> 16 bit, R/O (FC 04 read)
+      - HOLDING_REGISTER  -> 16 bit, R/W (FC 03 read, FC 06/16 write)
+
+    The simulator always writes on the server side regardless of R/W policy
+    (it owns the device); the policy applies to *clients* connecting to it.
+    """
+    COIL = "coil"
+    DISCRETE_INPUT = "discrete_input"
+    INPUT_REGISTER = "input_register"
+    HOLDING_REGISTER = "holding_register"
 
 
 # Number of 16-bit registers required for each data type.
+# For BOOL the unit is "1 bit" but we still account it as 1 slot in the
+# coil/discrete_input address space.
 REGISTERS_PER_TYPE: Dict[DataType, int] = {
     DataType.UINT16: 1,
     DataType.INT16: 1,
@@ -29,7 +51,13 @@ REGISTERS_PER_TYPE: Dict[DataType, int] = {
     DataType.INT32: 2,
     DataType.FLOAT32: 2,
     DataType.FLOAT64: 4,
+    DataType.BOOL: 1,
 }
+
+
+def is_bit_space(register_type: "RegisterType") -> bool:
+    """True if the address space stores 1-bit values (coil / discrete input)."""
+    return register_type in (RegisterType.COIL, RegisterType.DISCRETE_INPUT)
 
 
 class ModbusConfig(BaseModel):
@@ -61,14 +89,30 @@ class MeasurementFault(BaseModel):
     """
     Per-measurement fault injection.
 
-    Errors are evaluated when the client *reads* the registers backing this
-    measurement: a slave-exception (illegal data address) is returned for the
-    affected addresses, leaving the rest of the sensor reachable.
+    Read-side faults (server -> client) are evaluated when the client reads
+    the registers backing this measurement: a slave-exception is returned
+    for the affected addresses, leaving the rest of the sensor reachable.
+
+    Write-side faults (simulator -> registers) alter the value the
+    simulator writes, so reads still succeed but the client sees corrupted
+    or unrealistic data.
     """
-    error_rate: float = 0.0          # 0..1 probability per read
-    error_code: int = 2              # Modbus exception code (2 = ILLEGAL DATA ADDRESS)
-    frozen: bool = False             # If True, value is no longer updated by the simulator
-    drop_writes: bool = False        # If True, simulator does not write this measurement at all
+    # Read-side
+    error_rate: float = Field(default=0.0, ge=0.0, le=1.0)  # per-read failure probability
+    error_code: int = 2                                     # exception (2 = ILLEGAL DATA ADDRESS)
+
+    # Write-side (simulator)
+    frozen: bool = False             # value no longer updated by the simulator
+    drop_writes: bool = False        # simulator does NOT write this measurement at all
+    bit_flip_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Per-write probability of flipping a single random bit in the encoded
+    register payload before writing. Useful to test client-side CRC / sanity
+    checks. Independent of error_rate."""
+
+    drift_per_second: float = 0.0
+    """Linear drift applied to the generated value, in real units per second.
+    Positive drifts the value upward; negative downward. The drift accumulates
+    until clamped by min_value/max_value."""
 
 
 class SensorFault(BaseModel):
@@ -90,6 +134,7 @@ class MeasurementConfig(BaseModel):
     """Configuration for a single measurement within a sensor."""
     name: str
     offset: int = Field(ge=0)
+    register_type: RegisterType = RegisterType.HOLDING_REGISTER
     data_type: DataType = DataType.UINT16
     scale: float = 1.0
     min_value: float = 0.0
@@ -98,9 +143,30 @@ class MeasurementConfig(BaseModel):
     unit: Optional[str] = None
     fault: MeasurementFault = Field(default_factory=MeasurementFault)
 
+    @model_validator(mode="after")
+    def _align_data_type_to_register_type(self) -> "MeasurementConfig":
+        """
+        Keep `data_type` consistent with `register_type`:
+
+          - coil / discrete_input  -> force BOOL (1 bit)
+          - other spaces           -> coerce BOOL to UINT16
+
+        Coercion (rather than raise) keeps PATCH-style updates ergonomic:
+        the UI can flip register_type without first resetting data_type.
+        Runs as model_validator (not field_validator) so it triggers even
+        when data_type was left at its default.
+        """
+        if self.register_type in (RegisterType.COIL, RegisterType.DISCRETE_INPUT):
+            if self.data_type != DataType.BOOL:
+                self.data_type = DataType.BOOL
+        else:
+            if self.data_type == DataType.BOOL:
+                self.data_type = DataType.UINT16
+        return self
+
     @property
     def register_count(self) -> int:
-        """Number of 16-bit registers used by this measurement."""
+        """Number of 16-bit registers used by this measurement (1 for bit types)."""
         return REGISTERS_PER_TYPE[self.data_type]
 
 
@@ -136,16 +202,21 @@ class SensorConfig(BaseModel):
             raise ValueError(f"Unknown measurement: {measurement_name}")
         return self.base_address + m.offset
 
-    def address_range(self) -> Optional[range]:
-        """Return the absolute register range covered by this sensor, or None if empty."""
-        if not self.measurements:
-            return None
-        starts = [self.base_address + m.offset for m in self.measurements]
-        ends = [
-            self.base_address + m.offset + m.register_count
-            for m in self.measurements
-        ]
-        return range(min(starts), max(ends))
+    def address_ranges_by_type(self) -> Dict["RegisterType", range]:
+        """
+        Return the absolute address range covered by this sensor,
+        broken down per RegisterType (one range per address space used).
+        """
+        by_type: Dict["RegisterType", Tuple[int, int]] = {}
+        for m in self.measurements:
+            start = self.base_address + m.offset
+            end = start + m.register_count
+            cur = by_type.get(m.register_type)
+            if cur is None:
+                by_type[m.register_type] = (start, end)
+            else:
+                by_type[m.register_type] = (min(cur[0], start), max(cur[1], end))
+        return {rt: range(s, e) for rt, (s, e) in by_type.items()}
 
 
 class AppConfig(BaseModel):

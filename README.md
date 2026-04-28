@@ -17,8 +17,12 @@ slave Modbus sullo stesso listener TCP e ci scrive sopra i valori generati.
 - **Web UI plug-and-play** — catalogo di 15 misure note (temperatura, CO2,
   PM, energia, tensione, ...), CRUD sensori/misure, valori live, register
   dump per debug.
-- **Tutti i tipi Modbus**: `uint16`, `int16`, `uint32`, `int32`, `float32`,
-  `float64`, con qualunque combinazione di `byte_order` / `word_order`.
+- **Tutti gli spazi Modbus**: coil (FC 01/05/15), discrete input (FC 02),
+  input register (FC 04), holding register (FC 03/06/16). Tutti coesistono
+  contemporaneamente sullo stesso `unit_id`, ognuno con il proprio address space.
+- **Tutti i tipi Modbus** sui registri 16-bit: `uint16`, `int16`, `uint32`,
+  `int32`, `float32`, `float64`, con qualunque combinazione di `byte_order` /
+  `word_order`. Coil e discrete input sono booleani (1 bit).
 - **Multi-rate** — ogni misura ha il suo `update_rate`; ogni sensore può
   imporre un `write_rate_seconds` (es. "scrivi al massimo una volta al
   minuto").
@@ -149,7 +153,25 @@ vengono scritti col `modbus.unit_id` configurato.
 5. **Register dump** in basso: tabella per ogni `unit_id` con
    `address / hex / dec / owner`, utile per capire cosa il client legge.
 
+## Spazi Modbus supportati
+
+Ogni `unit_id` espone tutti e 4 gli spazi Modbus, esattamente come un device
+reale. Sono tutti indipendenti: un coil all'address 0 e un holding register
+all'address 0 sono indirizzi distinti.
+
+| Spazio (`register_type`) | Larghezza | R/W | Function code (read) | Function code (write) | Tipico utilizzo |
+| ------------------------ | --------- | --- | -------------------- | --------------------- | --------------- |
+| `coil`                   | 1 bit     | R/W | FC 01                | FC 05 / 15            | Comandi/uscite digitali (start/stop, relè) |
+| `discrete_input`         | 1 bit     | R/O | FC 02                | —                     | Ingressi digitali (finecorsa, presenza, allarmi) |
+| `input_register`         | 16 bit    | R/O | FC 04                | —                     | Misure/contatori firmware (R/O) |
+| `holding_register`       | 16 bit    | R/W | FC 03                | FC 06 / 16            | Misure analogiche, setpoint, configurazione |
+
+Per ogni misura si imposta il `register_type` (default: `holding_register`).
+Per `coil` e `discrete_input` il `data_type` è forzato a `bool` (1 bit).
+
 ## Tipi di dato e endianness
+
+Validi per `input_register` e `holding_register` (registri a 16 bit):
 
 | Tipo      | Registri | Range                                              |
 | --------- | -------- | -------------------------------------------------- |
@@ -159,6 +181,7 @@ vengono scritti col `modbus.unit_id` configurato.
 | `int32`   | 2        | `-2_147_483_648 .. 2_147_483_647`                  |
 | `float32` | 2        | IEEE 754 single                                    |
 | `float64` | 4        | IEEE 754 double                                    |
+| `bool`    | 1 bit    | `0` / `1` (solo per `coil` / `discrete_input`)     |
 
 Combinazioni byte/word order (esempio `uint32 = 0xAABBCCDD`):
 
@@ -187,16 +210,29 @@ dalla UI senza fermare il simulatore.
 
 ### Per misura (`MeasurementFault`)
 
-| Campo         | Effetto                                                                  |
-| ------------- | ------------------------------------------------------------------------ |
-| `error_rate`  | Probabilità di restituire exception sui registri di **questa** misura.   |
-| `error_code`  | Default `2` = ILLEGAL DATA ADDRESS.                                      |
-| `frozen`      | Il valore non viene più aggiornato dal generatore.                       |
-| `drop_writes` | Il simulatore calcola il valore (UI lo vede) ma **non** scrive il regs.  |
+| Campo               | Effetto                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------ |
+| `error_rate`        | Probabilità di restituire exception sui registri di **questa** misura (0..1).        |
+| `error_code`        | Default `2` = ILLEGAL DATA ADDRESS.                                                  |
+| `frozen`            | Il valore non viene più aggiornato dal generatore.                                   |
+| `drop_writes`       | Il simulatore calcola il valore (UI lo vede) ma **non** scrive il registro.          |
+| `bit_flip_rate`     | Probabilità per scrittura di flippare un bit casuale nel payload codificato (0..1).  |
+| `drift_per_second`  | Deriva lineare in unità reali al secondo (positiva o negativa). Si accumula.         |
 
-> **Nota.** I guasti del server lavorano sulle *read*: il client Modbus che
-> sta leggendo vede l'errore. `frozen` e `drop_writes` lavorano lato
-> *simulatore* (sui valori scritti).
+> **Nota.** `error_rate` lavora sulle *read* (lato client). Tutti gli altri
+> lavorano lato *simulatore* (alterando ciò che viene scritto). `frozen` e
+> `drop_writes` mantengono il valore stabile, `bit_flip_rate` corrompe i
+> singoli bit (utile per testare CRC / sanity check), `drift_per_second`
+> simula un sensore che si scalibra nel tempo (utile per testare alarm
+> threshold dello SCADA).
+
+### Fault one-shot e di rete (via API, non in config)
+
+| Endpoint                                                          | Effetto                                                                  |
+| ----------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `POST /api/server/kick`                                           | Droppa **tutte** le connessioni TCP attive (test del reconnect lato client). I registri sono preservati, il listener riparte subito. |
+| `POST /api/sensors/{id}/measurements/{name}/spike`                | Inietta un valore arbitrario per `duration_seconds`. Body: `{"value": 99.0, "duration_seconds": 5.0}`. |
+| `DELETE /api/sensors/{id}/measurements/{name}/spike`              | Cancella uno spike attivo prima della scadenza.                          |
 
 ## Configurazione YAML — schema completo
 
@@ -268,23 +304,28 @@ scritture Modbus a 60s per imitare un device frugale.
 Le seguenti misure hanno generatori realistici e sono già pronte nel
 catalogo della UI:
 
-| Nome         | Tipo default | Unit | Pattern                                 |
-| ------------ | ------------ | ---- | --------------------------------------- |
-| temperature  | int16 ×10    | °C   | sinusoide ~24°C ±2°C                    |
-| humidity     | uint16 ×10   | %    | sinusoide ~55% ±7%                      |
-| co2          | uint16       | ppm  | base 520ppm + picchi sinusoidali        |
-| tvoc         | uint16       | ppb  | correlato al CO2                        |
-| pm25         | uint16       | µg/m³| base ~12, picchi casuali ogni 60-120s   |
-| pm10         | uint16       | µg/m³| correlato al PM2.5                      |
-| lux          | uint16       | lux  | pattern giorno/notte 50..850 lux        |
-| noise        | uint16 ×10   | dB   | base ~38dB ±3dB                         |
-| pressure     | uint16       | hPa  | atmosferica generica                    |
-| voltage      | float32      | V    | tensione di rete ~230V                  |
-| current      | float32      | A    | corrente generica                       |
-| power        | float32      | W    | potenza generica                        |
-| energy       | float64      | kWh  | contatore (alta precisione)             |
-| frequency    | float32      | Hz   | frequenza di rete ~50Hz                 |
-| custom       | uint16       | —    | misura libera, sinusoidale generico     |
+| Nome             | Spazio           | Tipo         | Unit  | Pattern                                       |
+| ---------------- | ---------------- | ------------ | ----- | --------------------------------------------- |
+| temperature      | holding          | int16 ×10    | °C    | sinusoide ~24°C ±2°C                          |
+| humidity         | holding          | uint16 ×10   | %     | sinusoide ~55% ±7%                            |
+| co2              | holding          | uint16       | ppm   | base 520ppm + picchi sinusoidali              |
+| tvoc             | holding          | uint16       | ppb   | correlato al CO2                              |
+| pm25             | holding          | uint16       | µg/m³ | base ~12, picchi casuali ogni 60-120s         |
+| pm10             | holding          | uint16       | µg/m³ | correlato al PM2.5                            |
+| lux              | holding          | uint16       | lux   | pattern giorno/notte 50..850 lux              |
+| noise            | holding          | uint16 ×10   | dB    | base ~38dB ±3dB                               |
+| pressure         | holding          | uint16       | hPa   | atmosferica generica                          |
+| voltage          | holding          | float32      | V     | tensione di rete ~230V                        |
+| current          | holding          | float32      | A     | corrente generica                             |
+| power            | holding          | float32      | W     | potenza generica                              |
+| energy           | holding          | float64      | kWh   | contatore (alta precisione)                   |
+| frequency        | holding          | float32      | Hz    | frequenza di rete ~50Hz                       |
+| custom           | holding          | uint16       | —     | misura libera, sinusoidale generico           |
+| alarm_active     | **coil**         | bool         | —     | mostly OFF, picchi rari (~5%)                 |
+| motor_run        | **coil**         | bool         | —     | onda quadra ~30s                              |
+| presence         | **discrete_in**  | bool         | —     | onda quadra ~30s                              |
+| limit_switch     | **discrete_in**  | bool         | —     | onda quadra ~30s                              |
+| uptime_seconds   | **input_reg**    | uint32       | s     | contatore monotonico (secondi dall'avvio)     |
 
 Per nomi non in catalogo viene usato un generatore sinusoidale generico
 basato su `min_value` / `max_value`.
@@ -304,8 +345,11 @@ basato su `min_value` / `max_value`.
 | `DELETE`| `/api/sensors/{id}/measurements/{name}`        | Elimina una misura                         |
 | `POST`  | `/api/server/start`                            | Avvia il server Modbus integrato           |
 | `POST`  | `/api/server/stop`                             | Stop                                       |
+| `POST`  | `/api/server/kick`                             | Droppa tutte le connessioni TCP attive     |
 | `POST`  | `/api/simulator/start`                         | Avvia il loop di simulazione               |
 | `POST`  | `/api/simulator/stop`                          | Stop                                       |
+| `POST`  | `/api/sensors/{id}/measurements/{name}/spike`  | Inietta un valore one-shot                 |
+| `DELETE`| `/api/sensors/{id}/measurements/{name}/spike`  | Cancella uno spike attivo                  |
 | `GET`   | `/api/status`                                  | Stato server + simulatore + valori live    |
 | `GET`   | `/api/events?limit=N`                          | Ultimi N eventi (aggiornamenti misure)     |
 | `GET`   | `/api/slaves`                                  | Dump registri per ciascuno slave           |

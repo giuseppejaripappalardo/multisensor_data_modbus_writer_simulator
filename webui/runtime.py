@@ -20,7 +20,7 @@ from typing import Deque, Dict, List, Optional
 
 import yaml
 
-from models import AppConfig
+from models import AppConfig, RegisterType
 from modbus_server import EmbeddedModbusServer
 from simulator.scheduler import EmbeddedServerSink, SensorSimulator
 from utils.logging import get_logger
@@ -98,8 +98,15 @@ class Runtime:
         running = self._server is not None and self._server.is_running()
         slaves: List[dict] = []
         if self._server is not None:
-            for uid, size in sorted(self._server.slave_sizes().items()):
-                slaves.append({"unit_id": uid, "registers": size})
+            sizes = self._server.slave_sizes()
+            for uid in sorted(sizes.keys()):
+                slaves.append({
+                    "unit_id": uid,
+                    # Per-space sizes for the UI status panel.
+                    "sizes": {rt.value: sz for rt, sz in sizes[uid].items()},
+                    # Aggregate count for compact display.
+                    "registers": sum(sizes[uid].values()),
+                })
         return {
             "running": running,
             "host": self._config.server.host,
@@ -130,6 +137,25 @@ class Runtime:
         if self._server is not None:
             self._server.stop()
             self._server = None
+
+    def kick_clients(self) -> None:
+        """Drop all current TCP connections (for testing client reconnect)."""
+        if self._server is None or not self._server.is_running():
+            raise RuntimeError("Server is not running")
+        self._server.kick()
+
+    def inject_spike(
+        self, sensor_id: str, measurement_name: str,
+        value: float, duration_seconds: float,
+    ) -> None:
+        if self._simulator is None or not self._simulator.is_running():
+            raise RuntimeError("Simulator is not running")
+        self._simulator.inject_spike(sensor_id, measurement_name, value, duration_seconds)
+
+    def clear_spike(self, sensor_id: str, measurement_name: str) -> bool:
+        if self._simulator is None:
+            return False
+        return self._simulator.clear_spike(sensor_id, measurement_name)
 
     # ---- simulator -------------------------------------------------------
 
@@ -176,13 +202,25 @@ class Runtime:
         return list(self._events)[:limit]
 
     def slave_dump(self) -> List[dict]:
-        """Snapshot of all slave register banks for the debugging view."""
+        """
+        Snapshot of every (unit_id, register_type) data block for the debug
+        view. The UI groups by unit_id and shows one table per non-empty
+        address space.
+        """
         if self._server is None or not self._server.is_running():
             return []
+        all_sizes = self._server.slave_sizes()
         out: List[dict] = []
         for uid in self._server.supported_unit_ids():
-            size = self._server.slave_sizes().get(uid, 0)
-            registers = self._server.read_holding(uid, 0, size)
+            sizes = all_sizes.get(uid, {})
+            spaces = []
+            for rt, size in sizes.items():
+                values = self._server.read_block(uid, rt, 0, size)
+                spaces.append({
+                    "register_type": rt.value,
+                    "size": size,
+                    "registers": values,
+                })
             sensors = []
             for sensor in self._config.sensors:
                 if sensor.unit_id != uid:
@@ -194,6 +232,7 @@ class Runtime:
                         "name": m.name,
                         "address": base,
                         "register_count": m.register_count,
+                        "register_type": m.register_type.value,
                         "data_type": m.data_type.value,
                         "scale": m.scale,
                         "unit": m.unit,
@@ -207,8 +246,7 @@ class Runtime:
                 })
             out.append({
                 "unit_id": uid,
-                "size": size,
-                "registers": registers,
+                "spaces": spaces,
                 "sensors": sensors,
             })
         return out

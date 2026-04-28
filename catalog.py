@@ -11,7 +11,7 @@ from typing import Dict, List, Optional
 
 from pydantic import BaseModel
 
-from models import DataType
+from models import DataType, RegisterType
 
 
 class MeasurementTemplate(BaseModel):
@@ -19,6 +19,7 @@ class MeasurementTemplate(BaseModel):
     name: str
     label: str
     unit: str
+    register_type: RegisterType = RegisterType.HOLDING_REGISTER
     data_type: DataType = DataType.UINT16
     scale: float = 1.0
     min_value: float = 0.0
@@ -133,6 +134,47 @@ CATALOG: List[MeasurementTemplate] = [
         data_type=DataType.UINT16, scale=1.0,
         min_value=0.0, max_value=65535.0, update_rate=1.0,
         description="Misura libera con pattern sinusoidale generico",
+        generator="generic",
+    ),
+    # ---------------------------------------------------------------
+    # 1-bit measurements (coil / discrete input)
+    # ---------------------------------------------------------------
+    MeasurementTemplate(
+        name="alarm_active", label="Allarme attivo", unit="",
+        register_type=RegisterType.COIL, data_type=DataType.BOOL,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=1.0,
+        description="Stato allarme R/W (coil) — 0=inattivo, 1=attivo",
+        generator="boolean_rare",
+    ),
+    MeasurementTemplate(
+        name="motor_run", label="Motore in marcia", unit="",
+        register_type=RegisterType.COIL, data_type=DataType.BOOL,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=2.0,
+        description="Comando run/stop motore (coil R/W)",
+        generator="boolean_periodic",
+    ),
+    MeasurementTemplate(
+        name="presence", label="Presenza", unit="",
+        register_type=RegisterType.DISCRETE_INPUT, data_type=DataType.BOOL,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=0.5,
+        description="Sensore di presenza (discrete input R/O)",
+        generator="boolean_periodic",
+    ),
+    MeasurementTemplate(
+        name="limit_switch", label="Finecorsa", unit="",
+        register_type=RegisterType.DISCRETE_INPUT, data_type=DataType.BOOL,
+        scale=1.0, min_value=0.0, max_value=1.0, update_rate=0.5,
+        description="Stato finecorsa (discrete input R/O)",
+        generator="boolean_periodic",
+    ),
+    # ---------------------------------------------------------------
+    # Read-only register: contatori / valori firmware (input register)
+    # ---------------------------------------------------------------
+    MeasurementTemplate(
+        name="uptime_seconds", label="Uptime", unit="s",
+        register_type=RegisterType.INPUT_REGISTER, data_type=DataType.UINT32,
+        scale=1.0, min_value=0.0, max_value=4_294_967_295.0, update_rate=1.0,
+        description="Contatore uptime device (input register, R/O)",
         generator="generic",
     ),
 ]

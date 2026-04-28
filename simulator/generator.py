@@ -67,6 +67,13 @@ class SensorGenerator:
             "pm10": self._gen_pm10,
             "lux": self._gen_lux,
             "noise": self._gen_noise,
+            # Boolean / discrete patterns
+            "alarm_active": self._gen_boolean_rare,
+            "motor_run": self._gen_boolean_periodic,
+            "presence": self._gen_boolean_periodic,
+            "limit_switch": self._gen_boolean_periodic,
+            # Counters
+            "uptime_seconds": self._gen_uptime,
         }
 
         gen_fn = generators.get(name)
@@ -139,6 +146,20 @@ class SensorGenerator:
 
     def _gen_noise(self, t: float) -> float:
         return 38.0 + math.sin(t / 20.0) * 3.0 + self.rng.gauss(0, 1)
+
+    # -- Boolean / counter patterns --
+
+    def _gen_boolean_rare(self, t: float) -> float:
+        """Mostly 0, with rare ON pulses (~5% of the time)."""
+        return 1.0 if self.rng.random() < 0.05 else 0.0
+
+    def _gen_boolean_periodic(self, t: float) -> float:
+        """Square wave with ~30s period."""
+        return 1.0 if int(t / 15.0) % 2 == 0 else 0.0
+
+    def _gen_uptime(self, t: float) -> float:
+        """Monotonic counter: seconds since simulator start."""
+        return float(int(t))
 
     # -- Generic pattern for custom measurements --
 
