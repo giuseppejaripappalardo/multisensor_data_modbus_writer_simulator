@@ -1,0 +1,26 @@
+services:
+  simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: multisensor-modbus-simulator:latest
+    container_name: multisensor-modbus-simulator
+    restart: unless-stopped
+    ports:
+      - "8000:8000"   # Web UI + REST API
+      - "502:502"     # Modbus TCP
+    environment:
+      UI_HOST: "0.0.0.0"
+      UI_PORT: "8000"
+      SIM_CONFIG_PATH: "/app/configs/runtime.yaml"
+      LOG_LEVEL: "INFO"
+    volumes:
+      # Persist runtime configuration across container restarts.
+      # The UI saves edits to this file automatically.
+      - ./configs:/app/configs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/status', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

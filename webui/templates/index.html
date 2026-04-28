@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Multisensor Modbus Simulator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
+</head>
+<body>
+  <div x-data="simApp" x-init="init()" class="layout">
+    <header>
+      <div class="brand">
+        <h1>Multisensor Modbus Simulator</h1>
+        <small>Plug-and-play sensor → measurements → Modbus TCP</small>
+      </div>
+      <div class="controls">
+        <div class="status-pill" :class="{ on: status.server.running }">
+          Server <span x-text="status.server.host + ':' + status.server.port"></span>
+          <small class="hint" x-show="status.server.slaves && status.server.slaves.length"
+                 x-text="' · ' + status.server.slaves.map(s => 'u' + s.unit_id).join(', ')"></small>
+          <strong x-text="status.server.running ? 'ON' : 'OFF'"></strong>
+        </div>
+        <button class="btn primary" @click="toggleServer()" x-text="status.server.running ? 'Ferma server' : 'Avvia server'"></button>
+        <div class="status-pill" :class="{ on: status.simulator.running }">
+          Simulatore <strong x-text="status.simulator.running ? 'ON' : 'OFF'"></strong>
+        </div>
+        <button class="btn primary" @click="toggleSimulator()" x-text="status.simulator.running ? 'Ferma simulatore' : 'Avvia simulatore'"></button>
+      </div>
+    </header>
+
+    <main>
+      <!-- LEFT: Catalog -->
+      <aside class="catalog">
+        <h2>Catalogo misure</h2>
+        <p class="hint">Trascina o seleziona un sensore poi clicca <em>+</em>.</p>
+        <ul>
+          <template x-for="t in catalog" :key="t.name">
+            <li class="cat-item">
+              <div class="cat-row">
+                <strong x-text="t.label"></strong>
+                <span class="badge" x-text="t.data_type"></span>
+              </div>
+              <div class="cat-meta">
+                <span x-text="t.unit"></span> · scale <span x-text="t.scale"></span> · <span x-text="t.register_count"></span> reg
+              </div>
+              <small x-text="t.description"></small>
+              <button class="btn small" :disabled="!selectedSensorId" @click="addMeasurementFromTemplate(t)">+ Aggiungi al sensore selezionato</button>
+            </li>
+          </template>
+        </ul>
+      </aside>
+
+      <!-- CENTER: Sensors -->
+      <section class="sensors">
+        <div class="section-head">
+          <h2>Sensori</h2>
+          <div class="add-form">
+            <input x-model="newSensor.id" placeholder="ID (es. office_aq)" />
+            <input x-model.number="newSensor.unit_id" type="number" min="0" max="247"
+                   title="Modbus slave / unit id" placeholder="Unit ID" />
+            <input x-model.number="newSensor.base_address" type="number" min="0" placeholder="Base addr" />
+            <select x-model="newSensor.byte_order">
+              <option value="big">byte=BIG</option>
+              <option value="little">byte=LITTLE</option>
+            </select>
+            <select x-model="newSensor.word_order">
+              <option value="big">word=BIG</option>
+              <option value="little">word=LITTLE</option>
+            </select>
+            <input x-model.number="newSensor.write_rate_seconds" type="number" min="0.1" step="0.5"
+                   title="Frequenza minima di write Modbus (secondi)" placeholder="Write rate s" />
+            <button class="btn primary" @click="createSensor()">+ Sensore</button>
+          </div>
+        </div>
+
+        <template x-if="config.sensors.length === 0">
+          <div class="empty">Nessun sensore. Crea il primo qui sopra.</div>
+        </template>
+
+        <template x-for="s in config.sensors" :key="s.id">
+          <article class="sensor" :class="{ selected: s.id === selectedSensorId }">
+            <header @click="selectedSensorId = s.id">
+              <div>
+                <h3 x-text="s.id"></h3>
+                <small>
+                  unit <strong x-text="s.unit_id"></strong> ·
+                  base <strong x-text="s.base_address"></strong> ·
+                  byte=<span x-text="s.byte_order"></span> ·
+                  word=<span x-text="s.word_order"></span> ·
+                  write <strong x-text="s.write_rate_seconds + 's'"></strong> ·
+                  <span x-text="s.measurements.length"></span> misure
+                </small>
+              </div>
+              <button class="btn danger small" @click.stop="deleteSensor(s.id)">elimina</button>
+            </header>
+
+            <div class="sensor-body">
+              <div class="row two-col">
+                <label title="Modbus slave / unit id - sensori con unit id diversi sono isolati come dispositivi indipendenti dietro un gateway.">
+                  Unit ID
+                  <input type="number" min="0" max="247" :value="s.unit_id"
+                         @change="patchSensor(s.id, { unit_id: +$event.target.value })" />
+                </label>
+                <label>
+                  Base address
+                  <input type="number" min="0" :value="s.base_address" @change="patchSensor(s.id, { base_address: +$event.target.value })" />
+                </label>
+                <label>
+                  Byte order
+                  <select :value="s.byte_order" @change="patchSensor(s.id, { byte_order: $event.target.value })">
+                    <option value="big">big</option>
+                    <option value="little">little</option>
+                  </select>
+                </label>
+                <label>
+                  Word order
+                  <select :value="s.word_order" @change="patchSensor(s.id, { word_order: $event.target.value })">
+                    <option value="big">big</option>
+                    <option value="little">little</option>
+                  </select>
+                </label>
+                <label title="Frequenza di scrittura sul Modbus per questo sensore. Si applica al massimo tra questo e l'update_rate della singola misura.">
+                  Write rate (s)
+                  <input type="number" min="0.1" step="0.5" :value="s.write_rate_seconds"
+                         @change="patchSensor(s.id, { write_rate_seconds: +$event.target.value })" />
+                </label>
+              </div>
+
+              <fieldset class="fault">
+                <legend>Fault injection (sensore)</legend>
+                <label>
+                  Latenza ms
+                  <input type="number" min="0" step="10" :value="s.fault.latency_ms"
+                         @change="patchSensor(s.id, { fault: { ...s.fault, latency_ms: +$event.target.value } })" />
+                </label>
+                <label>
+                  Error rate (0..1)
+                  <input type="number" min="0" max="1" step="0.05" :value="s.fault.error_rate"
+                         @change="patchSensor(s.id, { fault: { ...s.fault, error_rate: +$event.target.value } })" />
+                </label>
+                <label class="check">
+                  <input type="checkbox" :checked="s.fault.offline"
+                         @change="patchSensor(s.id, { fault: { ...s.fault, offline: $event.target.checked } })" />
+                  Offline (slave non risponde)
+                </label>
+              </fieldset>
+
+              <h4>Misure</h4>
+              <template x-if="s.measurements.length === 0">
+                <p class="empty">Nessuna misura. Aggiungi dal catalogo a sinistra (sensore selezionato → clicca +).</p>
+              </template>
+              <table x-show="s.measurements.length > 0">
+                <thead>
+                  <tr>
+                    <th>Nome</th>
+                    <th>Offset</th>
+                    <th>Tipo</th>
+                    <th>Scale</th>
+                    <th>Range</th>
+                    <th>Rate</th>
+                    <th>Fault</th>
+                    <th>Live</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="m in s.measurements" :key="m.name">
+                    <tr>
+                      <td><strong x-text="m.name"></strong><br /><small x-text="m.unit || ''"></small></td>
+                      <td>
+                        <input type="number" min="0" :value="m.offset"
+                               @change="patchMeasurement(s.id, m.name, { offset: +$event.target.value })" />
+                      </td>
+                      <td>
+                        <select :value="m.data_type"
+                                @change="patchMeasurement(s.id, m.name, { data_type: $event.target.value })">
+                          <template x-for="dt in dataTypes" :key="dt"><option :value="dt" x-text="dt"></option></template>
+                        </select>
+                      </td>
+                      <td>
+                        <input type="number" step="0.1" :value="m.scale"
+                               @change="patchMeasurement(s.id, m.name, { scale: +$event.target.value })" />
+                      </td>
+                      <td>
+                        <input type="number" step="0.1" :value="m.min_value"
+                               @change="patchMeasurement(s.id, m.name, { min_value: +$event.target.value })" />
+                        →
+                        <input type="number" step="0.1" :value="m.max_value"
+                               @change="patchMeasurement(s.id, m.name, { max_value: +$event.target.value })" />
+                      </td>
+                      <td>
+                        <input type="number" step="0.5" min="0.1" :value="m.update_rate"
+                               @change="patchMeasurement(s.id, m.name, { update_rate: +$event.target.value })" />s
+                      </td>
+                      <td class="fault-cell">
+                        <label title="Probabilità di errore in lettura per questa misura">
+                          err
+                          <input type="number" min="0" max="1" step="0.05" :value="m.fault.error_rate"
+                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, error_rate: +$event.target.value } })" />
+                        </label>
+                        <label class="check" title="Valore congelato: il simulatore non aggiorna più la misura">
+                          <input type="checkbox" :checked="m.fault.frozen"
+                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, frozen: $event.target.checked } })" />
+                          freeze
+                        </label>
+                        <label class="check" title="Drop writes: il simulatore non scrive sul registro">
+                          <input type="checkbox" :checked="m.fault.drop_writes"
+                                 @change="patchMeasurement(s.id, m.name, { fault: { ...m.fault, drop_writes: $event.target.checked } })" />
+                          drop
+                        </label>
+                      </td>
+                      <td class="live-cell">
+                        <template x-if="latestFor(s.id, m.name)">
+                          <div>
+                            <span x-text="formatValue(latestFor(s.id, m.name))"></span>
+                            <small x-text="liveAddrInfo(latestFor(s.id, m.name))"></small>
+                          </div>
+                        </template>
+                      </td>
+                      <td>
+                        <button class="btn danger small" @click="deleteMeasurement(s.id, m.name)">×</button>
+                      </td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+          </article>
+        </template>
+      </section>
+
+      <!-- RIGHT: Live -->
+      <aside class="live">
+        <h2>Status live</h2>
+        <div class="kv">
+          <div><span>Server</span><strong :class="status.server.running ? 'ok' : 'off'" x-text="status.server.running ? 'running' : 'stopped'"></strong></div>
+          <div><span>Listen</span><strong x-text="status.server.host + ':' + status.server.port"></strong></div>
+          <div><span>Default unit</span><strong x-text="status.server.default_unit_id"></strong></div>
+          <div><span>Simulator</span><strong :class="status.simulator.running ? 'ok' : 'off'" x-text="status.simulator.running ? 'running' : 'stopped'"></strong></div>
+          <div><span>Sensori</span><strong x-text="config.sensors.length"></strong></div>
+          <div><span>Misure tot.</span><strong x-text="totalMeasurements()"></strong></div>
+        </div>
+
+        <h3>Slaves attivi</h3>
+        <ul class="slave-list" x-show="status.server.slaves && status.server.slaves.length">
+          <template x-for="sl in status.server.slaves" :key="sl.unit_id">
+            <li>
+              <strong>u<span x-text="sl.unit_id"></span></strong>
+              <span x-text="sl.registers + ' reg'"></span>
+            </li>
+          </template>
+        </ul>
+        <p class="hint" x-show="!status.server.slaves || !status.server.slaves.length">Server non avviato.</p>
+
+        <h3>Eventi</h3>
+        <ol class="events">
+          <template x-for="(e, i) in events" :key="i">
+            <li>
+              <small x-text="formatTime(e.timestamp)"></small>
+              <strong x-text="e.sensor_id + '/' + e.name"></strong>
+              <span x-text="formatValue(e)"></span>
+              <span class="addr" x-text="'@' + e.address"></span>
+              <template x-if="e.frozen"><span class="tag warn">frozen</span></template>
+              <template x-if="e.dropped"><span class="tag warn">drop</span></template>
+            </li>
+          </template>
+        </ol>
+      </aside>
+    </main>
+
+    <section class="register-dump">
+      <header class="dump-header" @click="toggleDump()">
+        <h2>Vista registri (debug)</h2>
+        <span class="hint" x-text="dumpOpen ? '▾ chiudi' : '▸ apri'"></span>
+        <small x-show="dumpOpen && slaves.length === 0" class="hint">Avvia il server per popolare questa vista.</small>
+      </header>
+      <div x-show="dumpOpen" class="dump-body">
+        <template x-for="slave in slaves" :key="slave.unit_id">
+          <div class="slave">
+            <h3>Unit ID <span x-text="slave.unit_id"></span> · <small x-text="slave.size + ' registri'"></small></h3>
+            <table class="reg-table">
+              <thead>
+                <tr>
+                  <th>Addr</th>
+                  <th>Hex</th>
+                  <th>Dec</th>
+                  <th>Sensore / Misura</th>
+                </tr>
+              </thead>
+              <tbody>
+                <template x-for="(value, addr) in slave.registers" :key="addr">
+                  <tr :class="{ 'has-owner': addressOwner(slave, addr) }">
+                    <td x-text="addr"></td>
+                    <td class="hex" x-text="'0x' + value.toString(16).padStart(4, '0').toUpperCase()"></td>
+                    <td x-text="value"></td>
+                    <td>
+                      <template x-if="addressOwner(slave, addr)">
+                        <span>
+                          <strong x-text="addressOwner(slave, addr).sensorId + '.' + addressOwner(slave, addr).measurementName"></strong>
+                          <small x-text="addressOwner(slave, addr).hint"></small>
+                        </span>
+                      </template>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+          </div>
+        </template>
+      </div>
+    </section>
+
+    <footer>
+      <span x-show="message" class="msg" x-text="message"></span>
+    </footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

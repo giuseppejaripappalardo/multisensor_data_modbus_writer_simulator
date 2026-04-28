@@ -7,7 +7,20 @@
       "Bash(gh api:*)",
       "WebSearch",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:apollo3zehn.github.io)"
+      "WebFetch(domain:apollo3zehn.github.io)",
+      "Bash(python3 -m unittest tests.test_encoder -v)",
+      "Bash(pip3 install *)",
+      "Bash(python3 *)",
+      "Bash(curl -s http://127.0.0.1:8000/api/catalog)",
+      "Bash(curl -s http://127.0.0.1:8000/api/config)",
+      "Bash(curl *)",
+      "Bash(pkill -f \"python3 -m webui\")",
+      "Bash(xargs kill *)",
+      "Bash(docker --version)",
+      "Bash(docker info *)",
+      "Bash(set -e)",
+      "Bash(ps *)",
+      "Bash(kill 14062)"
     ]
   }
 }

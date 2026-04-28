@@ -1,0 +1,42 @@
+# Version control
+.git
+.gitignore
+
+# IDE / editor
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python caches
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Virtual envs
+.venv
+venv
+env
+
+# Build artefacts
+build
+dist
+
+# Local Claude / agent state
+.claude
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Docker artefacts (avoid recursive copy of compose state)
+docker-compose.override.yml

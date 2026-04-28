@@ -1,108 +1,234 @@
 """
 Sensor simulation orchestrator with per-measurement update rates.
-"""
-import time
-from typing import Dict, List, Tuple
 
-from models import AppConfig, SensorConfig, MeasurementConfig
-from modbus_client import ModbusClient
+Writes go to a RegisterSink, which can be:
+  - a ModbusClient (writes over TCP to a remote slave), or
+  - an EmbeddedModbusServer (writes directly to the in-process slave).
+
+The simulator runs as a daemon thread (start/stop are non-blocking) so the
+web UI and the CLI share the same engine.
+"""
+import threading
+import time
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
+
+from models import AppConfig, MeasurementConfig, SensorConfig
+from simulator.encoder import decode_value, encode_value
 from simulator.generator import SensorGenerator
-from simulator.encoder import encode_value, decode_value
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
+class RegisterSink(Protocol):
+    """Anything that can accept a contiguous block of holding-register writes."""
+    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool: ...
+
+
+# ---------------------------------------------------------------------------
+# Sink adapters
+# ---------------------------------------------------------------------------
+
+class ModbusClientSink:
+    """Adapter: forward writes to a remote Modbus TCP slave."""
+
+    def __init__(self, modbus_client):
+        self._client = modbus_client
+
+    def connect(self) -> bool:
+        return self._client.connect()
+
+    def disconnect(self) -> None:
+        self._client.disconnect()
+
+    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool:
+        # Legacy ModbusClient.write_register_blocks doesn't take unit_id per call;
+        # it uses the one in its config. Pass through unchanged.
+        return self._client.write_register_blocks(registers)
+
+
+class EmbeddedServerSink:
+    """Adapter: write directly to the in-process EmbeddedModbusServer."""
+
+    def __init__(self, server):
+        self._server = server
+
+    def connect(self) -> bool:
+        return True
+
+    def disconnect(self) -> None:
+        pass
+
+    def write_register_blocks(self, unit_id: int, registers: Dict[int, int]) -> bool:
+        if not registers:
+            return True
+        sorted_addrs = sorted(registers.keys())
+        start = sorted_addrs[0]
+        block: List[int] = [registers[start]]
+        expected = start + 1
+        for addr in sorted_addrs[1:]:
+            if addr == expected:
+                block.append(registers[addr])
+            else:
+                self._server.write_holding(unit_id, start, block)
+                start = addr
+                block = [registers[addr]]
+            expected = addr + 1
+        self._server.write_holding(unit_id, start, block)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Simulator engine
+# ---------------------------------------------------------------------------
+
 class SensorSimulator:
     """
-    Orchestrates the simulation of multiple sensors.
-
-    Each sensor has its own generator and per-measurement update rate scheduling.
+    Drives N SensorGenerators on a tick loop, writing due values to a sink.
+    Honors per-measurement update_rate, drop_writes and frozen flags.
     """
 
-    def __init__(self, config: AppConfig, modbus_client: ModbusClient):
+    def __init__(
+        self,
+        config: AppConfig,
+        sink: RegisterSink,
+        on_update: Optional[Callable[[str, List[dict]], None]] = None,
+    ):
         self.config = config
-        self.modbus_client = modbus_client
+        self.sink = sink
+        self.on_update = on_update
+
         self._running = False
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
         self._start_time = 0.0
+        self._lock = threading.Lock()
 
-        # Create a generator per sensor
+        # Per-sensor generators and last-update bookkeeping.
         self._generators: Dict[str, SensorGenerator] = {}
-        # Track last update time: sensor_id -> measurement_name -> time
         self._last_update: Dict[str, Dict[str, float]] = {}
+        self._frozen_values: Dict[str, Dict[str, float]] = {}
+        self._reset_state()
 
-        for sensor in config.sensors:
-            self._generators[sensor.id] = SensorGenerator(
-                sensor.id, sensor.measurements
-            )
-            self._last_update[sensor.id] = {
-                m.name: -float("inf") for m in sensor.measurements
-            }
+    # --- lifecycle ---------------------------------------------------
 
-    def start(self):
-        """Start the simulation loop."""
-        self._running = True
+    def start(self) -> bool:
+        with self._lock:
+            if self._running:
+                return True
+            self._running = True
+            self._stop_event.clear()
+
+        if hasattr(self.sink, "connect") and not self.sink.connect():
+            logger.error("Sink failed to connect")
+            with self._lock:
+                self._running = False
+            return False
+
+        self._reset_state()
         self._start_time = time.time()
+        self._thread = threading.Thread(
+            target=self._run_loop, name="sensor-simulator", daemon=True
+        )
+        self._thread.start()
+        logger.info("Sensor simulator started")
+        return True
 
-        logger.info("Starting sensor simulation")
-        logger.info(f"Tick interval: {self.config.tick_seconds}s")
-        logger.info(f"Sensors: {len(self.config.sensors)}")
+    def stop(self) -> None:
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        if hasattr(self.sink, "disconnect"):
+            try:
+                self.sink.disconnect()
+            except Exception:
+                pass
+        self._thread = None
+        logger.info("Sensor simulator stopped")
 
-        if not self.modbus_client.connect():
-            logger.error("Failed to connect to Modbus server")
-            return
+    def is_running(self) -> bool:
+        return self._running
 
+    # --- live config update -----------------------------------------
+
+    def reload_config(self, config: AppConfig) -> None:
+        """Replace the active configuration without restarting the loop."""
+        self.config = config
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        gens: Dict[str, SensorGenerator] = {}
+        last: Dict[str, Dict[str, float]] = {}
+        frozen: Dict[str, Dict[str, float]] = {}
+        for sensor in self.config.sensors:
+            gens[sensor.id] = SensorGenerator(sensor.id, sensor.measurements)
+            last[sensor.id] = {m.name: -float("inf") for m in sensor.measurements}
+            frozen[sensor.id] = {}
+        self._generators = gens
+        self._last_update = last
+        self._frozen_values = frozen
+
+    # --- internal ----------------------------------------------------
+
+    def _run_loop(self) -> None:
         try:
-            self._run_loop()
-        except KeyboardInterrupt:
-            logger.info("Received shutdown signal")
+            tick = max(0.05, self.config.tick_seconds)
+            next_tick = time.time()
+            while not self._stop_event.is_set():
+                now = time.time()
+                if now < next_tick:
+                    self._stop_event.wait(min(0.05, next_tick - now))
+                    continue
+                sim_time = now - self._start_time
+                for sensor in self.config.sensors:
+                    if self._stop_event.is_set():
+                        break
+                    self._update_sensor(sensor, sim_time)
+                next_tick += tick
+                if next_tick < now:
+                    next_tick = now + tick
+        except Exception as e:  # pragma: no cover
+            logger.error(f"Simulator loop crashed: {e}", exc_info=True)
         finally:
-            self.stop()
+            with self._lock:
+                self._running = False
 
-    def stop(self):
-        """Stop the simulation."""
-        self._running = False
-        self.modbus_client.disconnect()
-        logger.info("Simulation stopped")
+    def _update_sensor(self, sensor: SensorConfig, sim_time: float) -> None:
+        sensor_id = sensor.id
+        if sensor_id not in self._generators:
+            return
+        generator = self._generators[sensor_id]
+        last_updates = self._last_update[sensor_id]
+        frozen_values = self._frozen_values[sensor_id]
 
-    def _run_loop(self):
-        """Main simulation loop."""
-        tick = self.config.tick_seconds
-        next_tick = time.time()
-
-        while self._running:
-            now = time.time()
-            if now < next_tick:
-                time.sleep(min(0.01, next_tick - now))
-                continue
-
-            sim_time = now - self._start_time
-
-            for sensor in self.config.sensors:
-                self._update_sensor(sensor, sim_time)
-
-            next_tick += tick
-            if next_tick < now:
-                next_tick = now + tick
-
-    def _update_sensor(self, sensor: SensorConfig, sim_time: float):
-        """Update due measurements for a sensor and write to Modbus."""
-        generator = self._generators[sensor.id]
-        last_updates = self._last_update[sensor.id]
-
-        # Collect registers to write (address -> list of uint16 values)
         register_map: Dict[int, int] = {}
         updates: List[dict] = []
 
+        # Effective rate is the slower of the measurement-level rate and the
+        # sensor-level write rate. Lets the user throttle Modbus writes to
+        # e.g. once a minute even if individual measurements are faster.
+        sensor_rate = max(0.0, sensor.write_rate_seconds)
+
         for measurement in sensor.measurements:
-            last = last_updates[measurement.name]
-            if (sim_time - last) < measurement.update_rate:
+            effective_rate = max(measurement.update_rate, sensor_rate)
+            last = last_updates.get(measurement.name, -float("inf"))
+            if (sim_time - last) < effective_rate:
                 continue
+            last_updates[measurement.name] = sim_time
 
-            # Generate raw value
-            raw = generator.generate(measurement.name, sim_time)
+            # Compute the value:
+            #   - frozen=True   -> reuse last value (or generate one once if missing)
+            #   - drop_writes   -> compute a value for the UI but skip the write
+            if measurement.fault.frozen and measurement.name in frozen_values:
+                raw = frozen_values[measurement.name]
+            else:
+                raw = generator.generate(measurement.name, sim_time)
+                frozen_values[measurement.name] = raw
 
-            # Encode to register(s)
             regs = encode_value(
                 raw,
                 measurement.data_type,
@@ -112,102 +238,65 @@ class SensorSimulator:
                 sensor.byte_order,
                 sensor.word_order,
             )
+            try:
+                roundtrip = decode_value(
+                    regs, measurement.data_type, scale=measurement.scale,
+                    byte_order=sensor.byte_order, word_order=sensor.word_order,
+                )
+            except Exception:
+                roundtrip = float("nan")
 
-            # Round-trip decode to verify endianness
-            roundtrip = decode_value(
-                regs, measurement.data_type, scale=1.0,
-                byte_order=sensor.byte_order, word_order=sensor.word_order,
-            )
-
-            # Map to absolute addresses
             base_addr = sensor.base_address + measurement.offset
-            for i, val in enumerate(regs):
-                register_map[base_addr + i] = val
+            if not measurement.fault.drop_writes:
+                for i, val in enumerate(regs):
+                    register_map[base_addr + i] = val
 
-            regs_hex = "".join(f"{r:04x}" for r in regs)
             updates.append({
                 "name": measurement.name,
                 "raw": raw,
                 "scaled": raw * measurement.scale,
                 "data_type": measurement.data_type.value,
+                "address": base_addr,
                 "regs": regs,
-                "hex": regs_hex,
+                "hex": "".join(f"{r:04x}" for r in regs),
                 "roundtrip": roundtrip,
                 "byte_order": sensor.byte_order,
                 "word_order": sensor.word_order,
+                "unit": measurement.unit,
+                "frozen": bool(measurement.fault.frozen),
+                "dropped": bool(measurement.fault.drop_writes),
             })
 
-            last_updates[measurement.name] = sim_time
+        if register_map:
+            try:
+                ok = self.sink.write_register_blocks(sensor.unit_id, register_map)
+            except Exception as e:
+                logger.error(f"[{sensor_id}] write failed: {e}")
+                ok = False
+            if not ok:
+                logger.warning(f"[{sensor_id}] sink write returned False")
 
-        if not register_map:
-            return
-
-        # Write all registers in contiguous blocks
-        success = self.modbus_client.write_register_blocks(register_map)
-
-        # Log
-        self._log_update(sensor.id, updates, register_map, success)
-
-    def _log_update(
-        self,
-        sensor_id: str,
-        updates: List[dict],
-        registers: Dict[int, int],
-        success: bool,
-    ):
-        status = "OK" if success else "FAILED"
-        blocks = self._get_register_blocks(registers)
-        blocks_str = ", ".join(
-            f"[{s}:{s + c - 1}]" if c > 1 else f"[{s}]"
-            for s, c in blocks
-        )
-        logger.info(f"[{sensor_id}] {status} | blocks: {blocks_str}")
-        for u in updates:
-            dt = u["data_type"]
-            is_float = dt in ("float32", "float64")
-            if is_float:
-                scaled_str = f"{u['scaled']:.6f}"
-                rt_str = f"{u['roundtrip']:.6f}"
-            else:
-                scaled_str = f"{u['scaled']:.2f}"
-                rt_str = f"{u['roundtrip']}"
-            logger.info(
-                f"[{sensor_id}]   {u['name']}: "
-                f"raw={u['raw']:.4f}, "
-                f"type={dt}, "
-                f"scaled={scaled_str}, "
-                f"regs={u['regs']}, "
-                f"hex={u['hex']}, "
-                f"roundtrip={rt_str}, "
-                f"endian=byte:{u['byte_order']}/word:{u['word_order']}"
-            )
-
-    def _get_register_blocks(
-        self, registers: Dict[int, int]
-    ) -> List[Tuple[int, int]]:
-        """Group register addresses into contiguous (start, count) blocks."""
-        if not registers:
-            return []
-
-        sorted_addrs = sorted(registers.keys())
-        blocks = []
-        start = sorted_addrs[0]
-        count = 1
-
-        for addr in sorted_addrs[1:]:
-            if addr == start + count:
-                count += 1
-            else:
-                blocks.append((start, count))
-                start = addr
-                count = 1
-
-        blocks.append((start, count))
-        return blocks
+        if updates and self.on_update:
+            try:
+                self.on_update(sensor_id, updates)
+            except Exception as e:  # pragma: no cover
+                logger.error(f"on_update callback failed: {e}")
 
 
-def run_simulation(config: AppConfig):
-    """Run the sensor simulation."""
-    modbus_client = ModbusClient(config.modbus)
-    simulator = SensorSimulator(config, modbus_client)
-    simulator.start()
+def run_simulation(config: AppConfig) -> None:
+    """Blocking entry point used by the CLI. Writes to a remote Modbus TCP slave."""
+    from modbus_client import ModbusClient
+
+    client = ModbusClient(config.modbus)
+    sink = ModbusClientSink(client)
+    sim = SensorSimulator(config, sink)
+    if not sim.start():
+        return
+    try:
+        # Block until Ctrl+C.
+        while sim.is_running():
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        logger.info("Received shutdown signal")
+    finally:
+        sim.stop()
