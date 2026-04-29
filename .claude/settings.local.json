@@ -20,7 +20,9 @@
       "Bash(docker info *)",
       "Bash(set -e)",
       "Bash(ps *)",
-      "Bash(kill 14062)"
+      "Bash(kill 14062)",
+      "Bash(node -c C:/Users/giuse/Desktop/Sensor_Simulator/webui/static/app.js)",
+      "Bash(pip install *)"
     ]
   }
 }

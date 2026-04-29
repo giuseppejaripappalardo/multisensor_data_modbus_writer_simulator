@@ -11,14 +11,12 @@ document.addEventListener("alpine:init", () => {
     // Per-server raw register dump.
     slavesByServer: [],
     dumpOpen: false,
-    // (serverId, sensorId) currently expanded in the catalog "+ Add" target.
-    selectedTarget: { serverId: null, sensorId: null },
     // One pending "new sensor" form per server, keyed by serverId.
     newSensorByServer: {},
-    // Per-template preview drafts, keyed by template name. Each entry holds
-    // {register_type, offset, _key} where _key encodes the current target;
-    // when the target changes, the draft is regenerated lazily.
-    templateDrafts: {},
+    // One pending "new measurement" form per (serverId, sensorId), keyed
+    // by `${serverId}:${sensorId}`. Closed by default; opened from the
+    // "+ Aggiungi punto di misura" button on the sensor card.
+    newMeasurementByKey: {},
     newServer: {
       id: "", label: "", host: "0.0.0.0", port: 5020,
       default_unit_id: 1, register_count_min: 16, auto_start: false,
@@ -77,6 +75,21 @@ document.addEventListener("alpine:init", () => {
       const liveIds = new Set(this.config.servers.map(s => s.id));
       for (const sid of Object.keys(this.newSensorByServer)) {
         if (!liveIds.has(sid)) delete this.newSensorByServer[sid];
+      }
+      // Pre-create "new measurement" form scaffolds for each (server,sensor)
+      // pair so Alpine reactive expressions don't lazy-init mid-render.
+      const liveMeasureKeys = new Set();
+      for (const srv of this.config.servers) {
+        for (const s of srv.sensors) {
+          const key = this._formKey(srv.id, s.id);
+          liveMeasureKeys.add(key);
+          if (!this.newMeasurementByKey[key]) {
+            this.newMeasurementByKey[key] = this._blankMeasurementForm(srv.id, s.id);
+          }
+        }
+      }
+      for (const k of Object.keys(this.newMeasurementByKey)) {
+        if (!liveMeasureKeys.has(k)) delete this.newMeasurementByKey[k];
       }
     },
     async refreshStatus() {
@@ -246,19 +259,11 @@ document.addEventListener("alpine:init", () => {
           "POST", `/api/servers/${serverId}/sensors`, { ...draft },
         );
         await this.refreshConfig();
-        // Auto-select the newly created sensor as the catalog target so the
-        // user can immediately add measurements without an extra click.
-        this.selectedTarget = { serverId, sensorId: created.id };
         const srv = this.config.servers.find(s => s.id === serverId);
         this.newSensorByServer[serverId] = this.blankNewSensor(srv);
         this.newSensorByServer[serverId].unit_id = this.suggestNextUnitId(serverId);
         this.newSensorByServer[serverId].base_address = this.suggestNextBase(serverId);
-        this.flash(`✓ Sensore '${created.id}' creato in '${serverId}' e selezionato come target del catalogo`);
-        // Scroll the new sensor into view so the user actually sees it.
-        this.$nextTick(() => {
-          const el = document.querySelector(`article.sensor.selected`);
-          if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
-        });
+        this.flash(`✓ Sensore '${created.id}' creato in '${serverId}'`);
       } catch (_) { /* flashed */ }
     },
     async patchSensor(serverId, sensorId, patch) {
@@ -271,9 +276,7 @@ document.addEventListener("alpine:init", () => {
       if (!confirm(`Eliminare il sensore '${sensorId}' dal server '${serverId}'?`)) return;
       try {
         await this.fetchJSON("DELETE", `/api/servers/${serverId}/sensors/${sensorId}`);
-        if (this.selectedTarget.sensorId === sensorId) {
-          this.selectedTarget = { serverId: null, sensorId: null };
-        }
+        delete this.newMeasurementByKey[`${serverId}:${sensorId}`];
         await this.refreshConfig();
       } catch (_) {}
     },
@@ -295,86 +298,128 @@ document.addEventListener("alpine:init", () => {
     },
 
     // ---- Measurement CRUD ----
-    selectTarget(serverId, sensorId) {
-      this.selectedTarget = { serverId, sensorId };
+    _findSensor(serverId, sensorId) {
+      const srv = this.config.servers.find(s => s.id === serverId);
+      return srv && srv.sensors.find(s => s.id === sensorId);
     },
-    isTargetSelected(serverId, sensorId) {
-      return this.selectedTarget.serverId === serverId
-        && this.selectedTarget.sensorId === sensorId;
+    _formKey(serverId, sensorId) {
+      return `${serverId}:${sensorId}`;
     },
-    // Preview/edit support for the catalog "+ add" flow.
-    // Each template has a draft (register_type + offset) shown when a sensor
-    // is selected. The user can override before clicking +.
-    _targetSensor() {
-      const srv = this.config.servers.find(s => s.id === this.selectedTarget.serverId);
-      return srv && srv.sensors.find(s => s.id === this.selectedTarget.sensorId);
+    isMeasurementFormOpen(serverId, sensorId) {
+      const f = this.newMeasurementByKey[this._formKey(serverId, sensorId)];
+      return !!(f && f._open);
     },
-    ensureDraft(t) {
-      const targetKey = `${this.selectedTarget.serverId}:${this.selectedTarget.sensorId}`;
-      const cached = this.templateDrafts[t.name];
-      if (cached && cached._key === targetKey) return cached;
-      const sensor = this._targetSensor();
-      const draft = {
-        register_type: t.register_type,
-        offset: sensor ? this.nextOffset(sensor, t.register_type) : 0,
-        _key: targetKey,
+    measurementForm(serverId, sensorId) {
+      const key = this._formKey(serverId, sensorId);
+      if (!this.newMeasurementByKey[key]) {
+        this.newMeasurementByKey[key] = this._blankMeasurementForm(serverId, sensorId);
+      }
+      return this.newMeasurementByKey[key];
+    },
+    _blankMeasurementForm(serverId, sensorId) {
+      const sensor = this._findSensor(serverId, sensorId);
+      const rt = "holding_register";
+      return {
+        _open: false,
+        template_name: "",
+        name: "",
+        register_type: rt,
+        offset: sensor ? this.nextOffset(sensor, rt) : 0,
+        data_type: "uint16",
+        scale: 1.0,
+        min_value: 0.0,
+        max_value: 65535.0,
+        update_rate: 1.0,
+        unit: "",
       };
-      this.templateDrafts[t.name] = draft;
-      return draft;
     },
-    onDraftRtChange(t, rt) {
-      const draft = this.ensureDraft(t);
-      draft.register_type = rt;
-      // Recompute next-free offset for the new register_type space.
-      const sensor = this._targetSensor();
-      if (sensor) draft.offset = this.nextOffset(sensor, rt);
+    openMeasurementForm(serverId, sensorId) {
+      const key = this._formKey(serverId, sensorId);
+      // Always start from a fresh blank form so offset is recomputed.
+      this.newMeasurementByKey[key] = this._blankMeasurementForm(serverId, sensorId);
+      this.newMeasurementByKey[key]._open = true;
     },
-    previewAddress(t) {
-      const sensor = this._targetSensor();
-      if (!sensor) return null;
-      const draft = this.ensureDraft(t);
-      return sensor.base_address + draft.offset;
+    closeMeasurementForm(serverId, sensorId) {
+      const key = this._formKey(serverId, sensorId);
+      if (this.newMeasurementByKey[key]) {
+        this.newMeasurementByKey[key]._open = false;
+      }
     },
-    previewAddressText(t) {
-      const sensor = this._targetSensor();
-      if (!sensor) return "";
-      const draft = this.ensureDraft(t);
-      const abs = sensor.base_address + draft.offset;
-      const space = this.rtLabel(draft.register_type);
-      return `→ ${space} address ${abs} (base ${sensor.base_address} + offset ${draft.offset})`;
+    applyTemplateToForm(serverId, sensorId, templateName) {
+      const form = this.measurementForm(serverId, sensorId);
+      form.template_name = templateName;
+      if (!templateName) return;
+      const t = this.catalog.find(x => x.name === templateName);
+      if (!t) return;
+      const sensor = this._findSensor(serverId, sensorId);
+      // Pick a unique default name: prefer template.name, fall back to
+      // template.name + suffix if a measurement with that name exists.
+      let name = t.name;
+      if (sensor && sensor.measurements.some(m => m.name === name)) {
+        let i = 2;
+        while (sensor.measurements.some(m => m.name === `${t.name}_${i}`)) i++;
+        name = `${t.name}_${i}`;
+      }
+      form.name = name;
+      form.register_type = t.register_type;
+      form.data_type = t.data_type;
+      form.scale = t.scale;
+      form.min_value = t.min_value;
+      form.max_value = t.max_value;
+      form.update_rate = t.update_rate;
+      form.unit = t.unit || "";
+      form.offset = sensor ? this.nextOffset(sensor, t.register_type) : 0;
     },
-    targetServerLocked() {
-      return this.selectedTarget.serverId
-        ? this.isLocked(this.selectedTarget.serverId)
-        : false;
+    onMeasurementFormRtChange(serverId, sensorId, rt) {
+      const form = this.measurementForm(serverId, sensorId);
+      form.register_type = rt;
+      // Coil/discrete input → force bool; from a bit space back to register
+      // space → fall back to uint16 (mirrors backend validator).
+      if (this.isBitSpace(rt)) {
+        form.data_type = "bool";
+      } else if (form.data_type === "bool") {
+        form.data_type = "uint16";
+      }
+      const sensor = this._findSensor(serverId, sensorId);
+      if (sensor) form.offset = this.nextOffset(sensor, rt);
     },
-    async addMeasurementFromTemplate(t) {
-      const { serverId, sensorId } = this.selectedTarget;
-      if (!serverId || !sensorId) {
-        this.flash("Seleziona prima un sensore (cliccando sull'header)");
+    async submitMeasurement(serverId, sensorId) {
+      const form = this.measurementForm(serverId, sensorId);
+      if (!form.name?.trim()) {
+        this.flash("Il nome del punto è obbligatorio");
         return;
       }
-      const sensor = this._targetSensor();
-      if (!sensor) return;
-      const draft = this.ensureDraft(t);
+      // Send all fields explicitly — no template_name. The backend has no
+      // chance to "guess" a default and the data_type the user chose wins.
+      const payload = {
+        name: form.name.trim(),
+        offset: form.offset,
+        register_type: form.register_type,
+        data_type: form.data_type,
+        scale: form.scale,
+        min_value: form.min_value,
+        max_value: form.max_value,
+        update_rate: form.update_rate,
+        unit: form.unit || null,
+      };
       try {
         await this.fetchJSON(
           "POST",
           `/api/servers/${serverId}/sensors/${sensorId}/measurements`,
-          {
-            template_name: t.name,
-            offset: draft.offset,
-            register_type: draft.register_type,
-          },
+          payload,
         );
         await this.refreshConfig();
-        this.flash(
-          `Aggiunta '${t.label}' a ${serverId}/${sensorId} ` +
-          `@ ${this.rtLabel(draft.register_type)} ${sensor.base_address + draft.offset}`,
-        );
-        // Reset draft so the next "+ add" recomputes next-free for this template.
-        delete this.templateDrafts[t.name];
-      } catch (_) {}
+        this.flash(`✓ Punto '${payload.name}' aggiunto a ${serverId}/${sensorId}`);
+        this.closeMeasurementForm(serverId, sensorId);
+      } catch (_) { /* flashed */ }
+    },
+    // Periodo effettivo applicando il cap del sensore.
+    effectiveRate(sensor, m) {
+      const cap = +sensor.write_rate_seconds || 0;
+      const req = +m.update_rate || 0;
+      const eff = Math.max(cap, req);
+      // Evita display "1.00000001" in caso di numeri float imprecisi.
+      return Math.round(eff * 1000) / 1000;
     },
     nextOffset(sensor, registerType) {
       if (!sensor) return 0;

@@ -24,72 +24,7 @@
     </header>
 
     <main>
-      <!-- LEFT: Catalog -->
-      <aside class="catalog">
-        <h2>Catalogo misure</h2>
-        <div class="target-banner" :class="{ active: selectedTarget.sensorId }">
-          <template x-if="!selectedTarget.sensorId">
-            <small>
-              <strong>Nessun sensore selezionato.</strong><br>
-              Clicca <em>"Seleziona come target"</em> sulla card di un sensore per
-              indirizzarci le misure aggiunte dal catalogo.
-            </small>
-          </template>
-          <template x-if="selectedTarget.sensorId">
-            <small>
-              Target attivo:
-              <strong x-text="selectedTarget.serverId"></strong>
-              <span>/</span>
-              <strong x-text="selectedTarget.sensorId"></strong>
-            </small>
-          </template>
-        </div>
-        <ul>
-          <template x-for="t in catalog" :key="t.name">
-            <li class="cat-item">
-              <div class="cat-row">
-                <strong x-text="t.label"></strong>
-                <span class="badge" x-text="t.data_type"></span>
-              </div>
-              <div class="cat-meta">
-                <span x-text="t.unit || '—'"></span> · scale <span x-text="t.scale"></span> · <span x-text="t.register_count"></span> reg
-              </div>
-              <small x-text="t.description"></small>
-
-              <!-- Preview + edit del posizionamento, visibile solo quando un sensore è selezionato -->
-              <div class="cat-preview" x-show="selectedTarget.sensorId">
-                <div class="cat-preview-row">
-                  <label class="cat-preview-field" title="Spazio Modbus dove scrivere la misura. I 4 spazi sono indipendenti.">
-                    <span>Spazio</span>
-                    <select :disabled="targetServerLocked()"
-                            :value="ensureDraft(t).register_type"
-                            @change="onDraftRtChange(t, $event.target.value)">
-                      <template x-for="rt in registerTypes" :key="rt">
-                        <option :value="rt" x-text="rtLabel(rt)"></option>
-                      </template>
-                    </select>
-                  </label>
-                  <label class="cat-preview-field" title="Offset relativo al base_address del sensore. Auto-calcolato come 'primo slot libero' nello spazio scelto.">
-                    <span>Offset</span>
-                    <input type="number" min="0"
-                           :disabled="targetServerLocked()"
-                           x-model.number="ensureDraft(t).offset" />
-                  </label>
-                </div>
-                <small class="cat-preview-addr" x-text="previewAddressText(t)"></small>
-              </div>
-
-              <button class="btn small"
-                      :disabled="!selectedTarget.sensorId || targetServerLocked()"
-                      @click="addMeasurementFromTemplate(t)">
-                + Aggiungi al sensore selezionato
-              </button>
-            </li>
-          </template>
-        </ul>
-      </aside>
-
-      <!-- RIGHT: Servers area -->
+      <!-- Servers area (full width) -->
       <section class="servers">
         <!-- Create server form -->
         <article class="card create-server">
@@ -288,11 +223,11 @@
                     </select>
                   </label>
                   <label class="form-field">
-                    <span>Write rate (s)</span>
+                    <span>Min. periodo scrittura (s)</span>
                     <input type="number" min="0.1" step="0.5"
                            :disabled="isLocked(srv.id)"
                            x-model.number="newSensorByServer[srv.id].write_rate_seconds"
-                           title="Frequenza minima di scrittura sul Modbus per questo sensore. Vince il valore più alto tra questo e l'update_rate della singola misura." />
+                           title="Periodo minimo tra due scritture per qualunque punto di questo sensore. Funge da CAP: nessun punto verrà aggiornato più velocemente di così. Il periodo effettivo di ogni punto è max(periodo punto, periodo sensore)." />
                   </label>
                   <div class="form-field actions">
                     <button class="btn primary"
@@ -313,35 +248,22 @@
               </template>
 
               <template x-for="s in srv.sensors" :key="s.id">
-                <article class="sensor"
-                         :class="{ selected: isTargetSelected(srv.id, s.id) }">
+                <article class="sensor">
                   <header>
                     <div class="sensor-title">
                       <h4>
                         <span x-text="s.id"></span>
-                        <span class="target-badge" x-show="isTargetSelected(srv.id, s.id)"
-                              title="Questo è il sensore target del catalogo: le misure aggiunte dal catalogo finiranno qui.">
-                          ✓ Target
-                        </span>
                       </h4>
                       <small>
                         unit <strong x-text="s.unit_id"></strong>
                         · base <strong x-text="s.base_address"></strong>
                         · byte=<span x-text="s.byte_order"></span>
                         · word=<span x-text="s.word_order"></span>
-                        · write <strong x-text="s.write_rate_seconds + 's'"></strong>
+                        · min periodo <strong x-text="s.write_rate_seconds + 's'"></strong>
                         · <span x-text="s.measurements.length"></span> misure
                       </small>
                     </div>
                     <div class="sensor-actions">
-                      <button class="btn small"
-                              :class="{ primary: !isTargetSelected(srv.id, s.id) }"
-                              @click="selectTarget(srv.id, s.id)"
-                              :disabled="isTargetSelected(srv.id, s.id)"
-                              title="Imposta questo sensore come target per il catalogo. Le misure aggiunte dal catalogo finiranno qui.">
-                        <span x-show="!isTargetSelected(srv.id, s.id)">Seleziona come target</span>
-                        <span x-show="isTargetSelected(srv.id, s.id)">Selezionato</span>
-                      </button>
                       <button class="btn danger small"
                               :disabled="isLocked(srv.id)"
                               @click.stop="deleteSensor(srv.id, s.id)">
@@ -384,8 +306,8 @@
                           <option value="little">little</option>
                         </select>
                       </label>
-                      <label title="Sempre modificabile (live-reload).">
-                        Write rate (s)
+                      <label title="Periodo minimo tra due scritture per qualunque punto di questo sensore. Funge da CAP: nessun punto sarà aggiornato più velocemente. Il periodo effettivo di ogni punto è max(periodo punto, periodo sensore). Sempre modificabile (live-reload).">
+                        Min. periodo (s)
                         <input type="number" min="0.1" step="0.5"
                                :value="s.write_rate_seconds"
                                @change="patchSensor(srv.id, s.id, { write_rate_seconds: +$event.target.value })" />
@@ -411,10 +333,103 @@
                       </label>
                     </fieldset>
 
-                    <h5>Misure</h5>
-                    <template x-if="s.measurements.length === 0">
+                    <div class="measure-head">
+                      <h5>Misure</h5>
+                      <button class="btn small primary"
+                              :disabled="isLocked(srv.id)"
+                              @click="openMeasurementForm(srv.id, s.id)"
+                              x-show="!isMeasurementFormOpen(srv.id, s.id)"
+                              :title="isLocked(srv.id) ? 'Server in esecuzione: ferma il server per aggiungere misure.' : 'Aggiungi un nuovo punto di misura a questo sensore.'">
+                        + Aggiungi punto di misura
+                      </button>
+                    </div>
+
+                    <!-- Form inline creazione misura -->
+                    <fieldset class="add-measurement" x-show="isMeasurementFormOpen(srv.id, s.id)">
+                      <legend>Nuovo punto di misura su <code x-text="s.id"></code></legend>
+                      <div class="form-grid">
+                        <label class="form-field" title="Sceglie un preset dal catalogo: pre-popola tutti i campi con i valori tipici di quel tipo di sensore. Puoi sempre modificarli prima di salvare.">
+                          <span>Preset</span>
+                          <select :value="measurementForm(srv.id, s.id).template_name"
+                                  @change="applyTemplateToForm(srv.id, s.id, $event.target.value)">
+                            <option value="">— personalizzato —</option>
+                            <template x-for="t in catalog" :key="t.name">
+                              <option :value="t.name" x-text="t.label + ' (' + t.data_type + ')'"></option>
+                            </template>
+                          </select>
+                        </label>
+                        <label class="form-field">
+                          <span>Nome <em>*</em></span>
+                          <input x-model="measurementForm(srv.id, s.id).name"
+                                 placeholder="es. temperature_in"
+                                 title="Identificatore univoco entro questo sensore." />
+                        </label>
+                        <label class="form-field" title="Spazio Modbus dove scrivere la misura. I 4 spazi sono indipendenti.">
+                          <span>Spazio</span>
+                          <select :value="measurementForm(srv.id, s.id).register_type"
+                                  @change="onMeasurementFormRtChange(srv.id, s.id, $event.target.value)">
+                            <template x-for="rt in registerTypes" :key="rt">
+                              <option :value="rt" x-text="rtLabel(rt)"></option>
+                            </template>
+                          </select>
+                        </label>
+                        <label class="form-field" title="Offset relativo al base_address del sensore. Auto-calcolato come 'primo slot libero' nello spazio scelto.">
+                          <span>Offset</span>
+                          <input type="number" min="0"
+                                 x-model.number="measurementForm(srv.id, s.id).offset" />
+                        </label>
+                        <label class="form-field" title="Tipo dato Modbus. Sui coil/discrete input è forzato a bool.">
+                          <span>Data type</span>
+                          <select :value="measurementForm(srv.id, s.id).data_type"
+                                  :disabled="isBitSpace(measurementForm(srv.id, s.id).register_type)"
+                                  @change="measurementForm(srv.id, s.id).data_type = $event.target.value">
+                            <template x-for="dt in dataTypes" :key="dt">
+                              <option :value="dt" x-text="dt"></option>
+                            </template>
+                          </select>
+                        </label>
+                        <label class="form-field" title="Fattore di scala applicato al valore generato prima della codifica. Tipico: 10 su int per ottenere risoluzione 0.1, 1 su float.">
+                          <span>Scale</span>
+                          <input type="number" step="0.1"
+                                 x-model.number="measurementForm(srv.id, s.id).scale" />
+                        </label>
+                        <label class="form-field">
+                          <span>Min</span>
+                          <input type="number" step="0.1"
+                                 x-model.number="measurementForm(srv.id, s.id).min_value" />
+                        </label>
+                        <label class="form-field">
+                          <span>Max</span>
+                          <input type="number" step="0.1"
+                                 x-model.number="measurementForm(srv.id, s.id).max_value" />
+                        </label>
+                        <label class="form-field" title="Periodo richiesto per questo punto. Se più piccolo del 'Min. periodo' del sensore, viene innalzato a quello del sensore (cap).">
+                          <span>Periodo (s)</span>
+                          <input type="number" step="0.5" min="0.1"
+                                 x-model.number="measurementForm(srv.id, s.id).update_rate" />
+                        </label>
+                        <label class="form-field">
+                          <span>Unità</span>
+                          <input x-model="measurementForm(srv.id, s.id).unit"
+                                 placeholder="°C, %, ppm, ..." />
+                        </label>
+                        <div class="form-field actions">
+                          <button class="btn primary"
+                                  :disabled="!measurementForm(srv.id, s.id).name?.trim()"
+                                  @click="submitMeasurement(srv.id, s.id)">
+                            + Salva punto
+                          </button>
+                          <button class="btn"
+                                  @click="closeMeasurementForm(srv.id, s.id)">
+                            Annulla
+                          </button>
+                        </div>
+                      </div>
+                    </fieldset>
+
+                    <template x-if="s.measurements.length === 0 && !isMeasurementFormOpen(srv.id, s.id)">
                       <p class="empty">
-                        Nessuna misura. Seleziona questo sensore (clicca sull'header) e usa il catalogo a sinistra.
+                        Nessuna misura. Clicca <em>+ Aggiungi punto di misura</em> qui sopra.
                       </p>
                     </template>
                     <table x-show="s.measurements.length > 0">
@@ -426,7 +441,7 @@
                           <th>Tipo</th>
                           <th>Scale</th>
                           <th>Range</th>
-                          <th>Rate</th>
+                          <th title="Periodo richiesto per il punto. Il periodo effettivo è max(periodo punto, min. periodo del sensore).">Periodo (s)</th>
                           <th>Fault</th>
                           <th>Live</th>
                           <th></th>
@@ -479,7 +494,14 @@
                             </td>
                             <td>
                               <input type="number" step="0.5" min="0.1" :value="m.update_rate"
-                                     @change="patchMeasurement(srv.id, s.id, m.name, { update_rate: +$event.target.value })" />s
+                                     @change="patchMeasurement(srv.id, s.id, m.name, { update_rate: +$event.target.value })"
+                                     :title="'Periodo richiesto: ' + m.update_rate + 's. Periodo effettivo (cap del sensore applicato): ' + effectiveRate(s, m) + 's.'" />
+                              <template x-if="effectiveRate(s, m) > m.update_rate">
+                                <small class="rate-warn"
+                                       :title="'Innalzato dal min. periodo del sensore (' + s.write_rate_seconds + 's). Il punto viene aggiornato ogni ' + effectiveRate(s, m) + 's.'">
+                                  ⚠ <span x-text="'eff ' + effectiveRate(s, m) + 's'"></span>
+                                </small>
+                              </template>
                             </td>
                             <td class="fault-cell">
                               <label title="Probabilità di errore in lettura per questa misura">
