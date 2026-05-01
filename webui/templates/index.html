@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Multisensor Modbus Simulator</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <script src="/static/app.js?v=20260501-servers" defer></script>
   <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js" defer></script>
 </head>
 <body>
@@ -27,7 +28,7 @@
       <!-- Servers area (full width) -->
       <section class="servers">
         <!-- Add-server bar: button toggles inline form -->
-        <div class="add-server-bar" x-show="!serverFormOpen">
+        <div class="add-server-bar" x-show="(config.servers?.length || 0) > 0 && !serverFormOpen">
           <button class="btn primary"
                   @click="openServerForm()"
                   title="Crea un nuovo server Modbus TCP (listener su host:porta unici).">
@@ -97,7 +98,14 @@
 
         <!-- Empty state -->
         <template x-if="(config.servers?.length || 0) === 0 && !serverFormOpen">
-          <div class="empty">Nessun server configurato. Clicca <em>+ Aggiungi server</em> per crearne uno.</div>
+          <div class="empty empty-action">
+            <span>Nessun server configurato.</span>
+            <button class="btn primary"
+                    @click="openServerForm()"
+                    title="Crea un nuovo server Modbus TCP (listener su host:porta unici).">
+              + Aggiungi server
+            </button>
+          </div>
         </template>
 
         <!-- Server cards -->
@@ -730,6 +738,5 @@
     </footer>
   </div>
 
-  <script src="/static/app.js"></script>
 </body>
 </html>
