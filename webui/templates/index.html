@@ -26,10 +26,19 @@
     <main>
       <!-- Servers area (full width) -->
       <section class="servers">
-        <!-- Create server form -->
-        <article class="card create-server">
+        <!-- Add-server bar: button toggles inline form -->
+        <div class="add-server-bar" x-show="!serverFormOpen">
+          <button class="btn primary"
+                  @click="openServerForm()"
+                  title="Crea un nuovo server Modbus TCP (listener su host:porta unici).">
+            + Aggiungi server
+          </button>
+        </div>
+
+        <!-- Create server form (inline, opened via "+ Aggiungi server") -->
+        <article class="card create-server" x-show="serverFormOpen">
           <header class="card-head">
-            <h2>Crea un nuovo server</h2>
+            <h2>Nuovo server</h2>
             <small class="hint">Ogni server è un listener Modbus TCP indipendente (host:porta unici).</small>
           </header>
           <div class="card-body">
@@ -75,15 +84,20 @@
                 <span>Auto-start al boot</span>
               </label>
               <div class="form-field actions">
-                <button class="btn primary" @click="createServer()">+ Crea server</button>
+                <button class="btn primary"
+                        :disabled="!newServer.id?.trim()"
+                        @click="createServer()">
+                  + Crea server
+                </button>
+                <button class="btn" @click="closeServerForm()">Annulla</button>
               </div>
             </div>
           </div>
         </article>
 
         <!-- Empty state -->
-        <template x-if="(config.servers?.length || 0) === 0">
-          <div class="empty">Nessun server configurato. Creane uno qui sopra.</div>
+        <template x-if="(config.servers?.length || 0) === 0 && !serverFormOpen">
+          <div class="empty">Nessun server configurato. Clicca <em>+ Aggiungi server</em> per crearne uno.</div>
         </template>
 
         <!-- Server cards -->
@@ -358,12 +372,60 @@
                             </template>
                           </select>
                           <template x-if="selectedTemplate(srv.id, s.id)">
-                            <div class="template-info">
+                            <div class="template-info" :class="{ 'is-bit': consumerMappingFor(selectedTemplate(srv.id, s.id))?.isBit }">
+                              <div class="template-info-head">
+                                <span class="info-badge">ℹ Mappatura SCADA / BMS</span>
+                                <span class="template-name-tag" x-text="selectedTemplate(srv.id, s.id).label"></span>
+                              </div>
                               <p class="template-desc" x-text="selectedTemplate(srv.id, s.id).description"></p>
-                              <p class="template-consumer">
-                                <strong>Lettura lato consumer:</strong>
-                                <span x-text="consumerReadHint(selectedTemplate(srv.id, s.id))"></span>
-                              </p>
+                              <table class="mapping-table">
+                                <tbody>
+                                  <tr>
+                                    <th>Spazio Modbus</th>
+                                    <td><strong x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).registerSpace"></strong></td>
+                                  </tr>
+                                  <tr>
+                                    <th>Indirizzo</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).addressLabel"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>FC Lettura</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).fcRead"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>FC Scrittura</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).fcWrite"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>Word count</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).wordCount"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>Data type</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).dataType"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>Endianness</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).endianness"></td>
+                                  </tr>
+                                  <tr :class="{ 'highlight-row': consumerMappingFor(selectedTemplate(srv.id, s.id)).scaleNeeded }">
+                                    <th>Scale</th>
+                                    <td>
+                                      <strong x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).scaleValue"></strong>
+                                      —
+                                      <span x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).scaleInstruction"></span>
+                                    </td>
+                                  </tr>
+                                  <tr>
+                                    <th>Esempio</th>
+                                    <td class="example-cell" x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).example"></td>
+                                  </tr>
+                                  <tr>
+                                    <th>Unità</th>
+                                    <td x-text="consumerMappingFor(selectedTemplate(srv.id, s.id)).unit"></td>
+                                  </tr>
+                                </tbody>
+                              </table>
                             </div>
                           </template>
                         </label>
@@ -387,12 +449,12 @@
                           <input type="number" min="0"
                                  x-model.number="measurementForm(srv.id, s.id).offset" />
                         </label>
-                        <label class="form-field" title="Tipo dato Modbus. Sui coil/discrete input è forzato a bool.">
+                        <label class="form-field" title="Tipo dato Modbus. Sui coil/discrete input è forzato a bool (singolo bit). Sugli input/holding register il bool non è offerto: per gli stati 'a bit' usa una bitmask UINT16.">
                           <span>Data type</span>
                           <select :value="measurementForm(srv.id, s.id).data_type"
                                   :disabled="isBitSpace(measurementForm(srv.id, s.id).register_type)"
                                   @change="measurementForm(srv.id, s.id).data_type = $event.target.value">
-                            <template x-for="dt in dataTypes" :key="dt">
+                            <template x-for="dt in dataTypesFor(measurementForm(srv.id, s.id).register_type)" :key="dt">
                               <option :value="dt" x-text="dt"></option>
                             </template>
                           </select>
@@ -486,8 +548,9 @@
                             <td>
                               <select :value="m.data_type"
                                       :disabled="isLocked(srv.id) || isBitSpace(m.register_type)"
+                                      :title="isBitSpace(m.register_type) ? 'Su coil/discrete input il tipo è sempre bool (1 bit).' : 'Su input/holding register bool non è offerto: per stati a bit usa una bitmask UINT16.'"
                                       @change="patchMeasurement(srv.id, s.id, m.name, { data_type: $event.target.value })">
-                                <template x-for="dt in dataTypes" :key="dt"><option :value="dt" x-text="dt"></option></template>
+                                <template x-for="dt in dataTypesFor(m.register_type)" :key="dt"><option :value="dt" x-text="dt"></option></template>
                               </select>
                             </td>
                             <td>

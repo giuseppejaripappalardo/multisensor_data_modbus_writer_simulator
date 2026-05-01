@@ -818,9 +818,335 @@ QNA_TEMPLATES: List[MeasurementTemplate] = [
 
 
 # ============================================================================
+# ABB ACS580 — Variatore di frequenza (VFD / drive industriale)
+# ============================================================================
+# Inverter trifase per motori asincroni, Modbus TCP/RTU integrato (modulo
+# FBA Modbus). Diffuso in HVAC, pompe, ventilatori, compressori. Scelto qui
+# come terzo device per coprire i tipi Modbus che PAC2200 e QNA non usano:
+# INT16 (anche con segno per direzione/coppia), UINT16, UINT32, COIL e
+# DISCRETE_INPUT — tutti con scale ≠ 1 in stile "INT scaled" classico.
+#
+# Convenzioni dati (importanti per il consumer SCADA/BMS):
+#   - Indirizzamento: gli offset sotto sono 0-based (PDU). Sul gateway il
+#     mapping classico 4xxxx (holding) / 0xxxx (coil) / 1xxxx (discrete
+#     input) si ottiene aggiungendo 1 all'offset (es. offset 0 = @40001).
+#   - Tutti i valori 16/32 bit sono big-endian (byte_order=big, word_order=big).
+#   - "INT scaled": il device scrive nel registro un INTERO già moltiplicato
+#     per scale. Il consumer DEVE dividere per scale per ottenere l'unità
+#     ingegneristica. Es: registro 5000 con scale=100 → 50.00 Hz.
+#   - I COIL sono R/W (comandi al drive: run, reset). I DISCRETE INPUT sono
+#     R/O (stato del drive: ready, running, faulted, at-setpoint).
+#   - I contatori UINT32 (run time, kWh) occupano 2 registri a 16 bit.
+#
+# Lettura lato consumer (gateway/SCADA/PLC) — riassunto:
+#   - INT16/UINT16 con scale: word count 1, divisore = scale (10/100), offset 0.
+#   - UINT32: word count 2, big endian, divisore = 1.
+#   - COIL/DISCRETE_INPUT: bit singolo, FC 01/02 in lettura, FC 05/15 per
+#     scrivere i coil. Niente scale.
+#
+# Riferimento: ABB ACS580 firmware manual, Modbus mapping section.
+# I numeri qui sono semplificati/didattici (offset compatti) per facilitare
+# il test del simulatore — non corrispondono 1:1 al firmware ABB di
+# produzione, dove ogni parametro ha il suo indice nei gruppi 1..99.
+# ============================================================================
+
+ACS580_TEMPLATES: List[MeasurementTemplate] = [
+    # ----- Velocità motore (offset 0) — INT16 SIGNED ---------------------
+    MeasurementTemplate(
+        name="acs580_speed",
+        label="ACS580 · Velocità motore · @40001 · INT16 BE · scale=1 · RPM",
+        unit="RPM",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.INT16, scale=1.0,
+        min_value=-1800.0, max_value=1800.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Velocità albero motore (signed). "
+            "Indirizzo: 40001 (offset 0), 1 registro INT16 big-endian. "
+            "Scale: 1.0 (valore già in RPM, range ±1800 per motore 4 poli 50 Hz). "
+            "Segno: positivo = rotazione avanti, negativo = inversa. "
+            "Consumer: leggere come INT16 signed; nessuna divisione."
+        ),
+    ),
+
+    # ----- Frequenza di uscita (offset 1) — INT16 con scale=100 ----------
+    MeasurementTemplate(
+        name="acs580_frequency",
+        label="ACS580 · Frequenza uscita · @40002 · INT16 BE · scale=100 · Hz",
+        unit="Hz",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.INT16, scale=100.0,
+        min_value=-65.0, max_value=65.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Frequenza di uscita (signed: segno = direzione). "
+            "Indirizzo: 40002 (offset 1), 1 registro INT16 big-endian. "
+            "Scale: 100 → registro contiene Hz × 100. "
+            "Es: registro 5000 ⇒ 50.00 Hz; registro -2500 ⇒ -25.00 Hz. "
+            "Consumer: dividere per 100 per ottenere Hz."
+        ),
+    ),
+
+    # ----- Corrente motore (offset 2) — UINT16 con scale=10 --------------
+    MeasurementTemplate(
+        name="acs580_current",
+        label="ACS580 · Corrente motore · @40003 · UINT16 BE · scale=10 · A",
+        unit="A",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT16, scale=10.0,
+        min_value=0.0, max_value=300.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Corrente RMS al motore (modulo, sempre ≥ 0). "
+            "Indirizzo: 40003 (offset 2), 1 registro UINT16 big-endian. "
+            "Scale: 10 → registro contiene A × 10. "
+            "Es: registro 125 ⇒ 12.5 A. "
+            "Consumer: dividere per 10 per ottenere A."
+        ),
+    ),
+
+    # ----- Tensione DC bus (offset 3) — UINT16 senza scale ---------------
+    MeasurementTemplate(
+        name="acs580_dc_voltage",
+        label="ACS580 · Tensione DC bus · @40004 · UINT16 BE · scale=1 · V",
+        unit="V",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT16, scale=1.0,
+        min_value=0.0, max_value=900.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Tensione DC bus interna (raddrizzatore). "
+            "Indirizzo: 40004 (offset 3), 1 registro UINT16 big-endian. "
+            "Scale: 1.0 → registro = V. Tipico ACS580 400V class: 540-580 V "
+            "in normale, picchi a 750-800 V in frenata rigenerativa. "
+            "Consumer: leggere come UINT16; nessuna divisione."
+        ),
+    ),
+
+    # ----- Coppia motore (offset 4) — INT16 con scale=10 -----------------
+    MeasurementTemplate(
+        name="acs580_torque",
+        label="ACS580 · Coppia motore · @40005 · INT16 BE · scale=10 · %",
+        unit="%",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.INT16, scale=10.0,
+        min_value=-200.0, max_value=200.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Coppia motore in % della nominale (signed). "
+            "Indirizzo: 40005 (offset 4), 1 registro INT16 big-endian. "
+            "Scale: 10 → registro contiene % × 10. "
+            "Es: registro 850 ⇒ 85.0 %; registro -300 ⇒ -30.0 % (rigenerazione). "
+            "Consumer: dividere per 10 per ottenere %."
+        ),
+    ),
+
+    # ----- Potenza meccanica al motore (offset 5) — INT16 scale=10 ------
+    MeasurementTemplate(
+        name="acs580_power",
+        label="ACS580 · Potenza motore · @40006 · INT16 BE · scale=10 · kW",
+        unit="kW",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.INT16, scale=10.0,
+        min_value=-300.0, max_value=300.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Potenza all'albero motore (signed). "
+            "Indirizzo: 40006 (offset 5), 1 registro INT16 big-endian. "
+            "Scale: 10 → registro contiene kW × 10. "
+            "Es: registro 152 ⇒ 15.2 kW; -45 ⇒ -4.5 kW (motore in trascinamento). "
+            "Consumer: dividere per 10 per ottenere kW."
+        ),
+    ),
+
+    # ----- Temperatura motore stimata (offset 6) — INT16 con scale=1 -----
+    MeasurementTemplate(
+        name="acs580_motor_temp",
+        label="ACS580 · Temp. motore stimata · @40007 · INT16 BE · scale=1 · °C",
+        unit="°C",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.INT16, scale=1.0,
+        min_value=-40.0, max_value=200.0, update_rate=5.0,
+        description=(
+            "ABB ACS580 · Temperatura stimata avvolgimenti motore (modello termico). "
+            "Indirizzo: 40007 (offset 6), 1 registro INT16 big-endian. "
+            "Scale: 1.0 → registro = °C (signed per ambienti freddi). "
+            "Soglia tipica di trip: 130-150 °C su classe F. "
+            "Consumer: leggere come INT16 signed; nessuna divisione."
+        ),
+    ),
+
+    # ----- Run time totale (offset 7-8) — UINT32 (2 registri) ------------
+    MeasurementTemplate(
+        name="acs580_run_time",
+        label="ACS580 · Run time totale · @40008 · UINT32 BE · scale=1 · h",
+        unit="h",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT32, scale=1.0,
+        min_value=0.0, max_value=4_000_000_000.0, update_rate=10.0,
+        description=(
+            "ABB ACS580 · Contatore ore di marcia cumulative (motore in run). "
+            "Indirizzo: 40008-40009 (offset 7-8), 2 registri UINT32 big-endian "
+            "(MSW al primo registro). Scale: 1.0 → valore in ore. "
+            "Consumer: leggere 2 reg, ricomporre come UINT32 big endian (ABCD), "
+            "nessuna divisione. Non si resetta dal Modbus."
+        ),
+    ),
+
+    # ----- Energia totale (offset 9-10) — UINT32 (2 registri) ------------
+    MeasurementTemplate(
+        name="acs580_kwh_counter",
+        label="ACS580 · Energia totale · @40010 · UINT32 BE · scale=1 · kWh",
+        unit="kWh",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT32, scale=1.0,
+        min_value=0.0, max_value=4_000_000_000.0, update_rate=10.0,
+        description=(
+            "ABB ACS580 · Energia attiva consumata cumulativa. "
+            "Indirizzo: 40010-40011 (offset 9-10), 2 registri UINT32 big-endian. "
+            "Scale: 1.0 → valore in kWh interi (risoluzione 1 kWh). "
+            "Consumer: leggere 2 reg, ricomporre come UINT32 big endian; "
+            "nessuna divisione."
+        ),
+    ),
+
+    # ----- Status word (offset 11) — UINT16 bitmask ----------------------
+    MeasurementTemplate(
+        name="acs580_status_word",
+        label="ACS580 · Status word · @40012 · UINT16 BE · scale=1 · bitmask",
+        unit="",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT16, scale=1.0,
+        min_value=0.0, max_value=65535.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Status word (bitmask 16 bit). "
+            "Indirizzo: 40012 (offset 11), 1 registro UINT16 big-endian. "
+            "Scale: 1.0 (bitmask, NON dividere). "
+            "Bit di solito mappati: b0=Ready, b1=Enabled, b2=Running, "
+            "b3=Faulted, b4=At-setpoint, b5=Reverse, b6=Local, b7=Above-limit. "
+            "Consumer: leggere come UINT16 e fare AND con la maschera del bit "
+            "che interessa. Nessuna conversione di scala."
+        ),
+    ),
+
+    # ----- Fault word (offset 12) — UINT16 bitmask -----------------------
+    MeasurementTemplate(
+        name="acs580_fault_word",
+        label="ACS580 · Fault word · @40013 · UINT16 BE · scale=1 · bitmask",
+        unit="",
+        register_type=RegisterType.HOLDING_REGISTER,
+        data_type=DataType.UINT16, scale=1.0,
+        min_value=0.0, max_value=65535.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Fault word (bitmask 16 bit, 0 = nessun fault). "
+            "Indirizzo: 40013 (offset 12), 1 registro UINT16 big-endian. "
+            "Bit comuni: b0=Overcurrent, b1=Overvoltage, b2=Undervoltage, "
+            "b3=Motor-overtemp, b4=Drive-overtemp, b5=Earth-fault, "
+            "b6=Short-circuit, b7=Comm-loss. "
+            "Consumer: leggere come UINT16 e mascherare i bit. Reset via coil "
+            "00002 (reset_cmd)."
+        ),
+    ),
+
+    # ----- COILS (R/W) ----------------------------------------------------
+    MeasurementTemplate(
+        name="acs580_run_cmd",
+        label="ACS580 · CMD Run · @00001 · COIL · bool · ON/OFF",
+        unit="",
+        register_type=RegisterType.COIL,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=2.0,
+        description=(
+            "ABB ACS580 · Comando di marcia (R/W). "
+            "Indirizzo: 00001 (offset 0 sul COIL space). FC 01 in lettura, "
+            "FC 05 in scrittura singola, FC 15 in scrittura multipla. "
+            "1 = Run, 0 = Stop. È un COIL (NON un holding register): "
+            "lo SCADA scrive 0/1, niente scale, niente word count. "
+            "Tipicamente legato a una pulsantiera Run/Stop nel template HMI."
+        ),
+    ),
+
+    MeasurementTemplate(
+        name="acs580_reset_cmd",
+        label="ACS580 · CMD Reset fault · @00002 · COIL · bool · pulse",
+        unit="",
+        register_type=RegisterType.COIL,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=5.0,
+        description=(
+            "ABB ACS580 · Comando di reset fault (R/W, edge-triggered). "
+            "Indirizzo: 00002 (offset 1 sul COIL space). "
+            "Lo SCADA scrive 1 per resettare i fault, il drive lo riazzera "
+            "automaticamente. Trattare come un PULSE momentaneo. "
+            "Niente scale, niente data_type — è un singolo bit."
+        ),
+    ),
+
+    # ----- DISCRETE INPUTS (R/O) ------------------------------------------
+    MeasurementTemplate(
+        name="acs580_ready_status",
+        label="ACS580 · Stato Ready · @10001 · DISCRETE INPUT · bool",
+        unit="",
+        register_type=RegisterType.DISCRETE_INPUT,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Stato Ready (R/O). "
+            "Indirizzo: 10001 (offset 0 sul DISCRETE INPUT space). FC 02 in "
+            "lettura. È in DISCRETE INPUT (non COIL) perché è uno STATO "
+            "del drive, non un comando: il consumer lo legge e basta. "
+            "1 = drive pronto a partire (alimentato, no fault, abilitato)."
+        ),
+    ),
+
+    MeasurementTemplate(
+        name="acs580_running_status",
+        label="ACS580 · Stato Running · @10002 · DISCRETE INPUT · bool",
+        unit="",
+        register_type=RegisterType.DISCRETE_INPUT,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Stato Running (R/O). "
+            "Indirizzo: 10002 (offset 1 sul DISCRETE INPUT space). "
+            "1 = motore in rotazione (frequenza ≠ 0). Tipicamente cablato "
+            "al feedback Run dell'HMI per accendere la spia verde."
+        ),
+    ),
+
+    MeasurementTemplate(
+        name="acs580_fault_status",
+        label="ACS580 · Stato Fault · @10003 · DISCRETE INPUT · bool",
+        unit="",
+        register_type=RegisterType.DISCRETE_INPUT,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Stato Fault (R/O). "
+            "Indirizzo: 10003 (offset 2 sul DISCRETE INPUT space). "
+            "1 = è attivo un fault (vedere fault_word per il dettaglio). "
+            "Allarme tipico in sistema BMS, da combinare con notifica."
+        ),
+    ),
+
+    MeasurementTemplate(
+        name="acs580_at_setpoint",
+        label="ACS580 · At-Setpoint · @10004 · DISCRETE INPUT · bool",
+        unit="",
+        register_type=RegisterType.DISCRETE_INPUT,
+        data_type=DataType.BOOL, scale=1.0,
+        min_value=0.0, max_value=1.0, update_rate=1.0,
+        description=(
+            "ABB ACS580 · Stato At-Setpoint (R/O). "
+            "Indirizzo: 10004 (offset 3 sul DISCRETE INPUT space). "
+            "1 = velocità reale entro la finestra di tolleranza dal setpoint. "
+            "Usato in BMS per autorizzare le sequenze a valle (es. apertura "
+            "valvole, partenza pompe secondarie)."
+        ),
+    ),
+]
+
+
+# ============================================================================
 # Catalogo unificato
 # ============================================================================
-CATALOG: List[MeasurementTemplate] = PAC2200_TEMPLATES + QNA_TEMPLATES
+CATALOG: List[MeasurementTemplate] = (
+    PAC2200_TEMPLATES + QNA_TEMPLATES + ACS580_TEMPLATES
+)
 
 
 _BY_NAME: Dict[str, MeasurementTemplate] = {t.name: t for t in CATALOG}

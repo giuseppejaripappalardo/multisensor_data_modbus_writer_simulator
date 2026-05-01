@@ -101,6 +101,16 @@ class SensorGenerator:
             # Legacy alias (example.yaml): stesse correlazioni dei qna_*.
             "co2": 0, "tvoc": 1,
             "pm25": 0, "pm10": 1,
+            # ACS580: lo stato condiviso (running/speed/fault) deve essere
+            # costruito prima di status/fault word e prima dei contatori.
+            "acs580_speed": 0, "acs580_frequency": 0,
+            "acs580_current": 0, "acs580_torque": 0, "acs580_power": 0,
+            "acs580_dc_voltage": 0, "acs580_motor_temp": 0,
+            "acs580_status_word": 1, "acs580_fault_word": 1,
+            "acs580_run_time": 2, "acs580_kwh_counter": 2,
+            "acs580_run_cmd": 1, "acs580_reset_cmd": 1,
+            "acs580_ready_status": 1, "acs580_running_status": 1,
+            "acs580_fault_status": 1, "acs580_at_setpoint": 1,
             # PAC2200 ordering
             "pac2200_active_tariff": 0,
             "pac2200_v_l1_n": 1, "pac2200_v_l2_n": 1, "pac2200_v_l3_n": 1,
@@ -531,6 +541,213 @@ class SensorGenerator:
         burst = 8.0 if self.rng.random() < 0.05 else 0.0
         return clamp(base + burst + self.rng.gauss(0, 1.0), 35.0, 100.0)
 
+    # =========================================================================
+    # ABB ACS580 generators (variatore di frequenza)
+    # =========================================================================
+
+    def _acs580_ensure_state(self, t: float) -> None:
+        """
+        Cache shared state for the drive (running flag, speed, derived
+        electrical quantities). Modello semplificato: il drive lavora a cicli
+        di 10 minuti — 8 minuti di run con rampa + plateau + rampa giù, poi
+        2 minuti di stop. Una volta su 50 cicli inietta un fault breve.
+        """
+        if self._state.get("_acs580_t") == t:
+            return
+        self._state["_acs580_t"] = t
+
+        cycle_period = 600.0  # 10 minuti
+        run_fraction = 0.85   # 85% del ciclo in run
+        in_cycle = t % cycle_period
+        run_window = cycle_period * run_fraction
+        ramp = 30.0  # 30s rampa di salita e discesa
+
+        running = in_cycle < run_window
+        if running:
+            if in_cycle < ramp:
+                speed_pu = in_cycle / ramp
+            elif in_cycle > run_window - ramp:
+                speed_pu = max(0.0, (run_window - in_cycle) / ramp)
+            else:
+                speed_pu = 1.0
+        else:
+            speed_pu = 0.0
+
+        # Direzione: positiva di base, negativa raramente (2 cicli su 10).
+        direction = -1.0 if (int(t / cycle_period) % 5 == 4) else 1.0
+        # Velocità nominale 1450 RPM (motore 4 poli 50 Hz con scivolamento).
+        speed = direction * speed_pu * 1450.0
+        if running:
+            speed += self.rng.gauss(0, 4.0)
+
+        self._state["_acs580_running"] = running
+        self._state["_acs580_speed"] = speed
+
+        # Frequenza segue la velocità (50 Hz a 1500 RPM ideali).
+        self._state["_acs580_frequency"] = speed / 30.0  # rpm/30 = Hz approx
+
+        # Corrente: a vuoto ~5 A, a pieno carico ~22 A. Sempre positiva.
+        load = abs(speed_pu)
+        i_base = 4.5 + load * 18.0
+        self._state["_acs580_current"] = max(0.2, i_base + self.rng.gauss(0, 0.3))
+
+        # Coppia in % (signed): segue load × direction.
+        torque = load * 78.0 * direction + self.rng.gauss(0, 1.5) if running else 0.0
+        self._state["_acs580_torque"] = torque
+
+        # Potenza meccanica: P = T × ω = (T% × T_nom) × (rpm × 2π/60). Qui
+        # semplifichiamo: P_kW ≈ (torque% / 100) × (|speed| / 1500) × P_nom.
+        p_nom = 11.0  # kW motore tipico ACS580 piccolo
+        power = (torque / 100.0) * (abs(speed) / 1500.0) * p_nom
+        self._state["_acs580_power"] = power
+
+        # DC bus: 565 V tipico, sale a 700+ in frenata (regen).
+        regen = power < -0.5
+        dc = 760.0 if regen else 565.0
+        self._state["_acs580_dc_voltage"] = dc + self.rng.gauss(0, 1.5)
+
+        # Temperatura motore: parte da 35°C, sale con load, scende a stop.
+        prev_temp = self._state.get("_acs580_motor_temp_last", 35.0)
+        target = 35.0 + load * 55.0  # 35°C a vuoto, 90°C a pieno carico
+        # Tau ≈ 5 minuti
+        prev_t = self._state.get("_acs580_temp_last_t", t)
+        dt = max(0.0, t - prev_t)
+        tau = 300.0
+        new_temp = prev_temp + (target - prev_temp) * (1.0 - math.exp(-dt / tau)) \
+            + self.rng.gauss(0, 0.2)
+        self._state["_acs580_motor_temp"] = new_temp
+        self._state["_acs580_motor_temp_last"] = new_temp
+        self._state["_acs580_temp_last_t"] = t
+
+        # Fault injection raro: ~0.5% probabilità per tick durante run.
+        prev_fault = self._state.get("_acs580_fault_active", False)
+        fault_until = self._state.get("_acs580_fault_until", 0.0)
+        if prev_fault and t < fault_until:
+            fault_active = True
+        elif running and self.rng.random() < 0.001:
+            fault_active = True
+            fault_until = t + self.rng.uniform(8.0, 20.0)
+            self._state["_acs580_fault_until"] = fault_until
+            # Sceglie un bit di fault casuale (b0..b7).
+            self._state["_acs580_fault_bit"] = self.rng.randrange(0, 8)
+        else:
+            fault_active = False
+            self._state.pop("_acs580_fault_bit", None)
+        self._state["_acs580_fault_active"] = fault_active
+
+    def _gen_acs580_speed(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_speed"]
+
+    def _gen_acs580_frequency(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_frequency"]
+
+    def _gen_acs580_current(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_current"]
+
+    def _gen_acs580_dc_voltage(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_dc_voltage"]
+
+    def _gen_acs580_torque(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_torque"]
+
+    def _gen_acs580_power(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_power"]
+
+    def _gen_acs580_motor_temp(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return self._state["_acs580_motor_temp"]
+
+    def _gen_acs580_run_time(self, t: float) -> float:
+        """Run time cumulativo in ore (incrementa solo quando il drive è in run)."""
+        self._acs580_ensure_state(t)
+        last_t = self._state.get("_acs580_run_time_last_t")
+        counter = self._state.get("_acs580_run_time", 12345.0)  # parte da un valore plausibile
+        if last_t is not None:
+            dt = t - last_t
+            if dt > 0 and self._state.get("_acs580_running", False):
+                counter += dt / 3600.0
+        self._state["_acs580_run_time"] = counter
+        self._state["_acs580_run_time_last_t"] = t
+        return counter
+
+    def _gen_acs580_kwh_counter(self, t: float) -> float:
+        """Energia totale cumulativa in kWh (integra |power|)."""
+        self._acs580_ensure_state(t)
+        last_t = self._state.get("_acs580_kwh_last_t")
+        counter = self._state.get("_acs580_kwh_counter", 5678.0)
+        if last_t is not None:
+            dt = t - last_t
+            power = self._state.get("_acs580_power", 0.0)
+            if dt > 0 and power > 0:
+                counter += power * dt / 3600.0
+        self._state["_acs580_kwh_counter"] = counter
+        self._state["_acs580_kwh_last_t"] = t
+        return counter
+
+    def _gen_acs580_status_word(self, t: float) -> float:
+        """Bitmask: b0=Ready, b1=Enabled, b2=Running, b3=Faulted, b4=AtSetpoint, b5=Reverse."""
+        self._acs580_ensure_state(t)
+        running = self._state.get("_acs580_running", False)
+        fault = self._state.get("_acs580_fault_active", False)
+        speed = self._state.get("_acs580_speed", 0.0)
+        bits = 0
+        if not fault:
+            bits |= 1 << 0  # Ready
+            bits |= 1 << 1  # Enabled
+        if running and not fault:
+            bits |= 1 << 2  # Running
+        if fault:
+            bits |= 1 << 3  # Faulted
+        if running and not fault and abs(speed) > 50:
+            bits |= 1 << 4  # At setpoint (semplificazione)
+        if speed < 0:
+            bits |= 1 << 5  # Reverse
+        return float(bits)
+
+    def _gen_acs580_fault_word(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        if not self._state.get("_acs580_fault_active", False):
+            return 0.0
+        bit = self._state.get("_acs580_fault_bit", 0)
+        return float(1 << bit)
+
+    def _gen_acs580_run_cmd(self, t: float) -> float:
+        """COIL R/W: emula un comando run che il consumer scrive. Qui rispecchia
+        lo stato running interno per dare un valore "vivo" sulla coil."""
+        self._acs580_ensure_state(t)
+        return 1.0 if self._state.get("_acs580_running", False) else 0.0
+
+    def _gen_acs580_reset_cmd(self, t: float) -> float:
+        """COIL R/W (pulse): valore di default 0; lo SCADA lo alza per resettare."""
+        return 0.0
+
+    def _gen_acs580_ready_status(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return 0.0 if self._state.get("_acs580_fault_active", False) else 1.0
+
+    def _gen_acs580_running_status(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        running = self._state.get("_acs580_running", False)
+        fault = self._state.get("_acs580_fault_active", False)
+        return 1.0 if (running and not fault) else 0.0
+
+    def _gen_acs580_fault_status(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        return 1.0 if self._state.get("_acs580_fault_active", False) else 0.0
+
+    def _gen_acs580_at_setpoint(self, t: float) -> float:
+        self._acs580_ensure_state(t)
+        running = self._state.get("_acs580_running", False)
+        fault = self._state.get("_acs580_fault_active", False)
+        speed = self._state.get("_acs580_speed", 0.0)
+        return 1.0 if (running and not fault and abs(speed) > 50) else 0.0
+
     def _gen_qna_illuminance(self, t: float) -> float:
         # Pattern giorno/notte 24 sim-min: 0-1500 lx con luce diurna,
         # 0-100 lx con illuminazione artificiale.
@@ -629,4 +846,22 @@ _GENERATORS = {
     "pm10":             lambda self, t: self._gen_qna_pm10(t),
     "sound":            lambda self, t: self._gen_qna_sound(t),
     "illuminance":      lambda self, t: self._gen_qna_illuminance(t),
+    # ABB ACS580 (variatore di frequenza)
+    "acs580_speed":          lambda self, t: self._gen_acs580_speed(t),
+    "acs580_frequency":      lambda self, t: self._gen_acs580_frequency(t),
+    "acs580_current":        lambda self, t: self._gen_acs580_current(t),
+    "acs580_dc_voltage":     lambda self, t: self._gen_acs580_dc_voltage(t),
+    "acs580_torque":         lambda self, t: self._gen_acs580_torque(t),
+    "acs580_power":          lambda self, t: self._gen_acs580_power(t),
+    "acs580_motor_temp":     lambda self, t: self._gen_acs580_motor_temp(t),
+    "acs580_run_time":       lambda self, t: self._gen_acs580_run_time(t),
+    "acs580_kwh_counter":    lambda self, t: self._gen_acs580_kwh_counter(t),
+    "acs580_status_word":    lambda self, t: self._gen_acs580_status_word(t),
+    "acs580_fault_word":     lambda self, t: self._gen_acs580_fault_word(t),
+    "acs580_run_cmd":        lambda self, t: self._gen_acs580_run_cmd(t),
+    "acs580_reset_cmd":      lambda self, t: self._gen_acs580_reset_cmd(t),
+    "acs580_ready_status":   lambda self, t: self._gen_acs580_ready_status(t),
+    "acs580_running_status": lambda self, t: self._gen_acs580_running_status(t),
+    "acs580_fault_status":   lambda self, t: self._gen_acs580_fault_status(t),
+    "acs580_at_setpoint":    lambda self, t: self._gen_acs580_at_setpoint(t),
 }

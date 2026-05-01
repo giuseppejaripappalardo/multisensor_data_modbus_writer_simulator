@@ -21,6 +21,7 @@ document.addEventListener("alpine:init", () => {
       id: "", label: "", host: "0.0.0.0", port: 5020,
       default_unit_id: 1, register_count_min: 16, auto_start: false,
     },
+    serverFormOpen: false,
     message: "",
     pollHandle: null,
 
@@ -149,6 +150,16 @@ document.addEventListener("alpine:init", () => {
     isBitSpace(rt) {
       return rt === "coil" || rt === "discrete_input";
     },
+    // Restituisce la lista di data_type compatibili con un dato register_type:
+    // - bit-space (coil/discrete_input) → solo "bool" (1 bit, è l'unico tipo
+    //   che ha senso fisicamente su quegli spazi).
+    // - register-space (holding/input) → tutti i tipi tranne "bool" (un
+    //   registro a 16 bit non ospita un singolo bit; per gli stati "a bit"
+    //   si usa una bitmask UINT16 con scale=1, vedi acs580_status_word).
+    dataTypesFor(rt) {
+      if (this.isBitSpace(rt)) return ["bool"];
+      return (this.dataTypes || []).filter(dt => dt !== "bool");
+    },
     rtLabel(rt) {
       const map = {
         coil: "Coil",
@@ -170,6 +181,17 @@ document.addEventListener("alpine:init", () => {
         write_rate_seconds: 1.0,
       };
     },
+    openServerForm() {
+      this.newServer = {
+        id: "", label: "", host: "0.0.0.0",
+        port: this.suggestNextPort(),
+        default_unit_id: 1, register_count_min: 16, auto_start: false,
+      };
+      this.serverFormOpen = true;
+    },
+    closeServerForm() {
+      this.serverFormOpen = false;
+    },
     async createServer() {
       if (!this.newServer.id.trim()) {
         this.flash("Devi specificare un id univoco per il server");
@@ -185,6 +207,7 @@ document.addEventListener("alpine:init", () => {
           port: this.suggestNextPort(),
           default_unit_id: 1, register_count_min: 16, auto_start: false,
         };
+        this.serverFormOpen = false;
       } catch (_) { /* flashed */ }
     },
     suggestNextPort() {
@@ -367,6 +390,82 @@ document.addEventListener("alpine:init", () => {
         ? "scale=1 ⇒ NESSUNA conversione, registro = valore reale"
         : `scale=${t.scale} ⇒ valore_reale = registro / ${t.scale}`;
       return `${dt}, ${wordCount} reg, ${endian}. ${scaleHint}. Unità: ${t.unit || "—"}.`;
+    },
+    // Mappatura SCADA / BMS strutturata per un template del catalogo.
+    // Ritorna un oggetto con i campi che la UI mostra in un alert tabellare.
+    consumerMappingFor(t) {
+      if (!t) return null;
+      const dt = t.data_type;
+      const rt = t.register_type || "holding_register";
+      const wordCount = ({
+        uint16: 1, int16: 1, bool: 1,
+        uint32: 2, int32: 2, float32: 2,
+        float64: 4,
+      })[dt] || 1;
+      const isBit = (rt === "coil" || rt === "discrete_input");
+      const fcRead = ({
+        coil: "FC 01 (Read Coils)",
+        discrete_input: "FC 02 (Read Discrete Inputs)",
+        input_register: "FC 04 (Read Input Registers)",
+        holding_register: "FC 03 (Read Holding Registers)",
+      })[rt];
+      const fcWrite = ({
+        coil: "FC 05 (Write Single Coil) / FC 15 (Write Multiple)",
+        discrete_input: "— sola lettura, lo SCADA non scrive",
+        input_register: "— sola lettura, lo SCADA non scrive",
+        holding_register: "FC 06 (Write Single) / FC 16 (Write Multiple)",
+      })[rt];
+      // Indirizzamento "umano" nei sistemi 4xxxx/0xxxx/1xxxx (offset+1).
+      const addrPrefix = ({
+        coil: "0",
+        discrete_input: "1",
+        input_register: "3",
+        holding_register: "4",
+      })[rt] || "4";
+      const scale = Number(t.scale) || 1;
+      const scaleNeeded = !isBit && scale !== 1;
+      let scaleInstruction;
+      if (isBit) {
+        scaleInstruction = "Non si applica (singolo bit 0/1).";
+      } else if (scale === 1) {
+        scaleInstruction = "Nessuna conversione: il valore di registro è già in unità ingegneristiche.";
+      } else {
+        scaleInstruction = `Dividere il valore di registro per ${scale} (Multiplier=1, Divisor=${scale}).`;
+      }
+      let example;
+      if (isBit) {
+        example = "Bit 1 = ON / 0 = OFF.";
+      } else if (dt === "float32" || dt === "float64") {
+        example = "Es: registro contiene direttamente 25.30 ⇒ 25.30 " + (t.unit || "");
+      } else if (scale === 1) {
+        const sample = Math.round(((Number(t.min_value) + Number(t.max_value)) / 2) || 0);
+        example = `Es: registro = ${sample} ⇒ ${sample} ${t.unit || ""}`;
+      } else {
+        const real = ((Number(t.min_value) + Number(t.max_value)) / 2) || 0;
+        const reg = Math.round(real * scale);
+        example = `Es: registro = ${reg} ⇒ ${reg}/${scale} = ${real.toFixed(2)} ${t.unit || ""}`;
+      }
+      let endianHint;
+      if (isBit) endianHint = "—";
+      else if (dt === "uint16" || dt === "int16") endianHint = "Big endian (1 reg)";
+      else if (dt === "float64") endianHint = "Big endian (ABCDEFGH, 4 reg, MSW prima)";
+      else endianHint = "Big endian (ABCD, MSW prima)";
+      return {
+        addressLabel: `${addrPrefix}xxxx (offset Modbus 0-based)`,
+        registerSpace: this.rtLabel(rt),
+        fcRead,
+        fcWrite,
+        wordCount: isBit ? "1 bit" : `${wordCount} registr${wordCount === 1 ? 'o' : 'i'} (16-bit ognuno)`,
+        dataType: dt,
+        endianness: endianHint,
+        scaleNeeded,
+        scaleValue: scale,
+        scaleInstruction,
+        example,
+        unit: t.unit || "—",
+        isBit,
+        rt,
+      };
     },
     consumerReadHintForMeasurement(m) {
       // Versione per misure già configurate (non template).

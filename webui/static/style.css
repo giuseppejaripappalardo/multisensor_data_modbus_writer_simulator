@@ -222,6 +222,12 @@ input[type=checkbox] { width: auto; }
   color: var(--accent);
 }
 
+.add-server-bar {
+  display: flex;
+  justify-content: flex-start;
+  margin-bottom: 4px;
+}
+
 /* ---- Server card ---- */
 .server-card {
   border: 1px solid var(--border);
@@ -428,26 +434,87 @@ tr.consumer-row .consumer-hint {
   grid-column: 1 / -1;
 }
 .template-info {
-  margin-top: 6px;
-  padding: 8px 10px;
-  background: rgba(64, 128, 255, 0.06);
-  border-left: 3px solid rgba(64, 128, 255, 0.4);
-  border-radius: 3px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: rgba(64, 128, 255, 0.08);
+  border-left: 4px solid rgba(64, 128, 255, 0.7);
+  border-radius: 4px;
   font-size: 12px;
+  line-height: 1.45;
 }
-.template-info .template-desc {
-  margin: 0 0 6px 0;
-  color: var(--text);
-  line-height: 1.4;
+.template-info.is-bit {
+  background: rgba(180, 120, 64, 0.10);
+  border-left-color: rgba(220, 140, 64, 0.85);
 }
-.template-info .template-consumer {
-  margin: 0;
-  color: var(--text);
+.template-info-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.template-info-head .info-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  background: rgba(64, 128, 255, 0.85);
+  color: white;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.template-info.is-bit .info-badge {
+  background: rgba(220, 140, 64, 0.95);
+}
+.template-info-head .template-name-tag {
   font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
   font-size: 11px;
+  color: var(--text-dim);
 }
-.template-info .template-consumer strong {
-  font-family: system-ui, sans-serif;
+.template-info .template-desc {
+  margin: 0 0 8px 0;
+  color: var(--text);
+}
+.template-info .mapping-table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  font-size: 11px;
+}
+.template-info .mapping-table th,
+.template-info .mapping-table td {
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+.template-info .mapping-table tr:last-child th,
+.template-info .mapping-table tr:last-child td {
+  border-bottom: 0;
+}
+.template-info .mapping-table th {
+  width: 130px;
+  color: var(--text-dim);
+  font-weight: 500;
+  background: rgba(0, 0, 0, 0.04);
+}
+.template-info .mapping-table td {
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+}
+.template-info .mapping-table tr.highlight-row td {
+  background: rgba(220, 180, 64, 0.18);
+  color: var(--text);
+}
+.template-info .mapping-table tr.highlight-row th {
+  background: rgba(220, 180, 64, 0.10);
+  color: var(--warn, #c97);
+  font-weight: 600;
+}
+.template-info .mapping-table .example-cell {
+  font-style: italic;
   color: var(--text);
 }
 
