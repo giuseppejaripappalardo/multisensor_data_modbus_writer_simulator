@@ -345,6 +345,47 @@ document.addEventListener("alpine:init", () => {
         this.newMeasurementByKey[key]._open = false;
       }
     },
+    selectedTemplate(serverId, sensorId) {
+      const form = this.measurementForm(serverId, sensorId);
+      if (!form.template_name) return null;
+      return this.catalog.find(x => x.name === form.template_name) || null;
+    },
+    consumerReadHint(t) {
+      // Costruisce una stringa pronta da incollare nel gateway/SCADA per
+      // configurare la lettura di questo registro.
+      if (!t) return "";
+      const dt = t.data_type;
+      const wordCount = ({
+        uint16: 1, int16: 1, bool: 1,
+        uint32: 2, int32: 2, float32: 2,
+        float64: 4,
+      })[dt] || 1;
+      const endian = (dt === "uint16" || dt === "int16" || dt === "bool")
+        ? "Big endian (1 reg)"
+        : "Big endian (ABCD: byte_order=big, word_order=big)";
+      const scaleHint = (Number(t.scale) === 1)
+        ? "scale=1 ⇒ NESSUNA conversione, registro = valore reale"
+        : `scale=${t.scale} ⇒ valore_reale = registro / ${t.scale}`;
+      return `${dt}, ${wordCount} reg, ${endian}. ${scaleHint}. Unità: ${t.unit || "—"}.`;
+    },
+    consumerReadHintForMeasurement(m) {
+      // Versione per misure già configurate (non template).
+      if (!m) return "";
+      const dt = m.data_type;
+      const wordCount = ({
+        uint16: 1, int16: 1, bool: 1,
+        uint32: 2, int32: 2, float32: 2,
+        float64: 4,
+      })[dt] || 1;
+      const endian = (dt === "uint16" || dt === "int16" || dt === "bool")
+        ? "Big endian (1 reg)"
+        : "Big endian (ABCD: byte_order=big, word_order=big)";
+      const scaleHint = (Number(m.scale) === 1)
+        ? "scale=1 ⇒ valore_reale = valore_registro"
+        : `scale=${m.scale} ⇒ valore_reale = valore_registro / ${m.scale}`;
+      const addr = (typeof m.address === "number") ? `@${40001 + m.address}` : `offset ${m.offset}`;
+      return `${addr}, ${dt}, ${wordCount} reg, ${endian}. ${scaleHint}. Unità: ${m.unit || "—"}.`;
+    },
     applyTemplateToForm(serverId, sensorId, templateName) {
       const form = this.measurementForm(serverId, sensorId);
       form.template_name = templateName;

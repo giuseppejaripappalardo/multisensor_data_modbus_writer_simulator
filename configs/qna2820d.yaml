@@ -1,0 +1,105 @@
+# ===========================================================================
+# Preset: Siemens QNA2820D (Symaro IAQ multi-sensor LoRaWAN)
+# ===========================================================================
+# Sensore ambientale 7-in-1 (T, RH, CO2, TVOC, PM2.5, PM10, sound, illuminance).
+# Trasmette in LoRaWAN; il gateway (Industrial Edge / TTN / ChirpStack /
+# Node-RED) decodifica il payload Protobuf Siemens e lo espone via Modbus.
+#
+# Convenzione adottata: "FLOAT32 verbose"
+#   - Ogni misura: FLOAT32 (2 reg) big-endian (ABCD), scale 1.0.
+#   - Il registro contiene direttamente il valore in unità ingegneristiche
+#     (es. 25.3 °C, 55.4 %RH, 600 ppm).
+#   - Slave ID Modbus: 1 (default convenzionale del gateway).
+#   - Cadenza uplink LoRaWAN reale: 5-15 minuti (qui simulato @ 300 s).
+#
+# NON esiste una mappa Modbus standard Siemens per il QNA2..D — il layout qui
+# adottato è quello tipico dei gateway LoRaWAN→Modbus moderni che parsano
+# preventivamente il payload e lo riespongono in float già decodificato.
+#
+# Riferimento sensore: datasheet Siemens A6V13589454.
+# ===========================================================================
+
+tick_seconds: 1.0
+log_level: INFO
+
+servers:
+  - id: qna_demo
+    label: QNA2820D demo
+    description: Siemens QNA2820D via gateway LoRaWAN→Modbus (FLOAT32 verbose)
+    host: 0.0.0.0
+    port: 5023
+    default_unit_id: 1
+    register_count_min: 32
+    auto_start: true
+    sensors:
+      - id: qna2820d
+        unit_id: 1
+        base_address: 0
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 60.0  # uplink lento (sim 1 min vs reale 5-15 min)
+        measurements:
+          - name: qna_temperature
+            offset: 0
+            data_type: float32
+            scale: 1.0
+            min_value: -5.0
+            max_value: 90.0
+            update_rate: 300.0
+            unit: °C
+          - name: qna_humidity
+            offset: 2
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 300.0
+            unit: "%RH"
+          - name: qna_co2
+            offset: 4
+            data_type: float32
+            scale: 1.0
+            min_value: 400.0
+            max_value: 5000.0
+            update_rate: 300.0
+            unit: ppm
+          - name: qna_tvoc
+            offset: 6
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 60000.0
+            update_rate: 300.0
+            unit: ppb
+          - name: qna_pm25
+            offset: 8
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1000.0
+            update_rate: 300.0
+            unit: µg/m³
+          - name: qna_pm10
+            offset: 10
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1000.0
+            update_rate: 300.0
+            unit: µg/m³
+          - name: qna_sound
+            offset: 12
+            data_type: float32
+            scale: 1.0
+            min_value: 35.0
+            max_value: 100.0
+            update_rate: 300.0
+            unit: dB(A)
+          - name: qna_illuminance
+            offset: 14
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 2000.0
+            update_rate: 300.0
+            unit: lx

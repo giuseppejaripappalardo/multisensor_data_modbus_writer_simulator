@@ -22,7 +22,21 @@
       "Bash(ps *)",
       "Bash(kill 14062)",
       "Bash(node -c C:/Users/giuse/Desktop/Sensor_Simulator/webui/static/app.js)",
-      "Bash(pip install *)"
+      "Bash(pip install *)",
+      "WebFetch(domain:www.aggsoft.com)",
+      "WebFetch(domain:docs.quantumbitsolutions.com)",
+      "WebFetch(domain:support.industry.siemens.com)",
+      "WebFetch(domain:cache.industry.siemens.com)",
+      "WebFetch(domain:docs.rs-online.com)",
+      "WebFetch(domain:www.manualslib.com)",
+      "WebFetch(domain:hit.sbt.siemens.com)",
+      "WebFetch(domain:www.kele.com)",
+      "WebFetch(domain:discourse.nodered.org)",
+      "WebFetch(domain:www.eibabo.com)",
+      "WebFetch(domain:reset.build)",
+      "WebFetch(domain:publikacje.siemens-info.com)",
+      "WebFetch(domain:hvac.de)",
+      "WebFetch(domain:uk.rs-online.com)"
     ]
   }
 }

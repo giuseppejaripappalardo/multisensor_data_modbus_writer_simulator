@@ -1,0 +1,457 @@
+# ===========================================================================
+# Preset: Siemens SENTRON PAC2200 (7KM2200-2EA00)
+# ===========================================================================
+# Power meter trifase, Modbus TCP. Replica fedele della register map
+# documentata nel manuale 7KM PAC2200 (doc. Siemens L1V30415167B-06).
+#
+# Convenzioni:
+#   - Slave ID Modbus default 126 (configurabile 1-247).
+#   - FC 0x03 / 0x04 restituiscono lo stesso contenuto.
+#   - FLOAT32 (2 reg) e DOUBLE 64-bit (4 reg) tutti big-endian (ABCD).
+#   - Scale: 1.0 ovunque (i valori sono già in unità ingegneristiche).
+#
+# Offset YAML = (offset manuale 1-based) - 1, perché il modello usa PDU
+# 0-based. Es: manuale "@40001" / "offset 1" → offset 0 nel YAML, sul filo
+# arriva come wire address 0x0000.
+#
+# Caricamento: copiare in configs/runtime.yaml o passare via CLI con
+#   python main.py --config configs/pac2200.yaml
+# ===========================================================================
+
+tick_seconds: 1.0
+log_level: INFO
+
+servers:
+  - id: pac2200_demo
+    label: PAC2200 demo
+    description: Siemens SENTRON PAC2200 (replica fedele register map)
+    host: 0.0.0.0
+    port: 5022
+    default_unit_id: 126
+    register_count_min: 1024
+    auto_start: true
+    sensors:
+      - id: pac2200
+        unit_id: 126
+        base_address: 0
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 1.0
+        measurements:
+          # ----- Tensioni Fase-Neutro (manuale offset 1, 3, 5) ---------------
+          - name: pac2200_v_l1_n
+            offset: 0
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 500.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_v_l2_n
+            offset: 2
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 500.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_v_l3_n
+            offset: 4
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 500.0
+            update_rate: 1.0
+            unit: V
+
+          # ----- Tensioni Fase-Fase concatenate (manuale offset 7, 9, 11) ----
+          - name: pac2200_v_l1_l2
+            offset: 6
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 900.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_v_l2_l3
+            offset: 8
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 900.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_v_l3_l1
+            offset: 10
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 900.0
+            update_rate: 1.0
+            unit: V
+
+          # ----- Correnti di linea (manuale offset 13, 15, 17) ---------------
+          - name: pac2200_i_l1
+            offset: 12
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 6500.0
+            update_rate: 1.0
+            unit: A
+          - name: pac2200_i_l2
+            offset: 14
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 6500.0
+            update_rate: 1.0
+            unit: A
+          - name: pac2200_i_l3
+            offset: 16
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 6500.0
+            update_rate: 1.0
+            unit: A
+
+          # ----- Potenze apparenti per fase (manuale offset 19, 21, 23) -----
+          - name: pac2200_s_l1
+            offset: 18
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: VA
+          - name: pac2200_s_l2
+            offset: 20
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: VA
+          - name: pac2200_s_l3
+            offset: 22
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: VA
+
+          # ----- Potenze attive per fase (manuale offset 25, 27, 29) --------
+          - name: pac2200_p_l1
+            offset: 24
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: W
+          - name: pac2200_p_l2
+            offset: 26
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: W
+          - name: pac2200_p_l3
+            offset: 28
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: W
+
+          # ----- Potenze reattive per fase (manuale offset 31, 33, 35) ------
+          - name: pac2200_q_l1
+            offset: 30
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: var
+          - name: pac2200_q_l2
+            offset: 32
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: var
+          - name: pac2200_q_l3
+            offset: 34
+            data_type: float32
+            scale: 1.0
+            min_value: -2000000.0
+            max_value: 2000000.0
+            update_rate: 1.0
+            unit: var
+
+          # ----- Power factor per fase (manuale offset 37, 39, 41) ----------
+          - name: pac2200_pf_l1
+            offset: 36
+            data_type: float32
+            scale: 1.0
+            min_value: -1.0
+            max_value: 1.0
+            update_rate: 1.0
+            unit: ""
+          - name: pac2200_pf_l2
+            offset: 38
+            data_type: float32
+            scale: 1.0
+            min_value: -1.0
+            max_value: 1.0
+            update_rate: 1.0
+            unit: ""
+          - name: pac2200_pf_l3
+            offset: 40
+            data_type: float32
+            scale: 1.0
+            min_value: -1.0
+            max_value: 1.0
+            update_rate: 1.0
+            unit: ""
+
+          # ----- THD-R Tensione per fase (manuale offset 43, 45, 47) --------
+          - name: pac2200_thd_v_l1
+            offset: 42
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 2.0
+            unit: "%"
+          - name: pac2200_thd_v_l2
+            offset: 44
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 2.0
+            unit: "%"
+          - name: pac2200_thd_v_l3
+            offset: 46
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 2.0
+            unit: "%"
+
+          # ----- THD-R Corrente per fase (manuale offset 49, 51, 53) --------
+          - name: pac2200_thd_i_l1
+            offset: 48
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 400.0
+            update_rate: 2.0
+            unit: "%"
+          - name: pac2200_thd_i_l2
+            offset: 50
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 400.0
+            update_rate: 2.0
+            unit: "%"
+          - name: pac2200_thd_i_l3
+            offset: 52
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 400.0
+            update_rate: 2.0
+            unit: "%"
+
+          # ----- Frequenza (manuale offset 55) ------------------------------
+          - name: pac2200_frequency
+            offset: 54
+            data_type: float32
+            scale: 1.0
+            min_value: 45.0
+            max_value: 65.0
+            update_rate: 1.0
+            unit: Hz
+
+          # ----- Medie e Totali (manuale offset 57-69) ----------------------
+          - name: pac2200_v_ln_avg
+            offset: 56
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 500.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_v_ll_avg
+            offset: 58
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 900.0
+            update_rate: 1.0
+            unit: V
+          - name: pac2200_i_avg
+            offset: 60
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 6500.0
+            update_rate: 1.0
+            unit: A
+          - name: pac2200_s_total
+            offset: 62
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 6000000.0
+            update_rate: 1.0
+            unit: VA
+          - name: pac2200_p_total
+            offset: 64
+            data_type: float32
+            scale: 1.0
+            min_value: -6000000.0
+            max_value: 6000000.0
+            update_rate: 1.0
+            unit: W
+          - name: pac2200_q_total
+            offset: 66
+            data_type: float32
+            scale: 1.0
+            min_value: -6000000.0
+            max_value: 6000000.0
+            update_rate: 1.0
+            unit: var
+          - name: pac2200_pf_total
+            offset: 68
+            data_type: float32
+            scale: 1.0
+            min_value: -1.0
+            max_value: 1.0
+            update_rate: 1.0
+            unit: ""
+
+          # ----- Stato e Tariffa (manuale offset 205, 207, 209, 211) --------
+          - name: pac2200_diagnostics
+            offset: 204
+            data_type: uint32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 4294967295.0
+            update_rate: 5.0
+            unit: ""
+          - name: pac2200_digital_input
+            offset: 206
+            data_type: uint32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 4294967295.0
+            update_rate: 2.0
+            unit: ""
+          - name: pac2200_digital_output
+            offset: 208
+            data_type: uint32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 4294967295.0
+            update_rate: 2.0
+            unit: ""
+          - name: pac2200_active_tariff
+            offset: 210
+            data_type: uint32
+            scale: 1.0
+            min_value: 1.0
+            max_value: 2.0
+            update_rate: 5.0
+            unit: ""
+
+          # ----- Energie totali (manuale offset 801-837): DOUBLE 64-bit BE ---
+          - name: pac2200_eact_imp_t1
+            offset: 800
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: Wh
+          - name: pac2200_eact_imp_t2
+            offset: 804
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: Wh
+          - name: pac2200_eact_exp_t1
+            offset: 808
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: Wh
+          - name: pac2200_eact_exp_t2
+            offset: 812
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: Wh
+          - name: pac2200_ereact_imp_t1
+            offset: 816
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: varh
+          - name: pac2200_ereact_imp_t2
+            offset: 820
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: varh
+          - name: pac2200_ereact_exp_t1
+            offset: 824
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: varh
+          - name: pac2200_ereact_exp_t2
+            offset: 828
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: varh
+          - name: pac2200_eapp_t1
+            offset: 832
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: VAh
+          - name: pac2200_eapp_t2
+            offset: 836
+            data_type: float64
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1.0e12
+            update_rate: 5.0
+            unit: VAh

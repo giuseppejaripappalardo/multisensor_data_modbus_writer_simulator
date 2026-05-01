@@ -407,6 +407,50 @@ tr.warning-row td {
   margin-right: 4px;
 }
 
+tr.consumer-row td {
+  background: rgba(64, 128, 255, 0.06);
+  border-bottom: 1px solid var(--border);
+  padding: 5px 12px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+tr.consumer-row .consumer-label {
+  font-weight: 600;
+  color: var(--text);
+  margin-right: 6px;
+}
+tr.consumer-row .consumer-hint {
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+}
+
+.form-field-wide {
+  grid-column: 1 / -1;
+}
+.template-info {
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: rgba(64, 128, 255, 0.06);
+  border-left: 3px solid rgba(64, 128, 255, 0.4);
+  border-radius: 3px;
+  font-size: 12px;
+}
+.template-info .template-desc {
+  margin: 0 0 6px 0;
+  color: var(--text);
+  line-height: 1.4;
+}
+.template-info .template-consumer {
+  margin: 0;
+  color: var(--text);
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+  font-size: 11px;
+}
+.template-info .template-consumer strong {
+  font-family: system-ui, sans-serif;
+  color: var(--text);
+}
+
 .sensor-body { padding: 10px 12px; }
 .row.two-col { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 8px; }
 .row.two-col label { display: flex; flex-direction: column; font-size: 12px; color: var(--text-dim); gap: 2px; }

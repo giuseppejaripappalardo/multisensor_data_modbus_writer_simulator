@@ -348,7 +348,7 @@
                     <fieldset class="add-measurement" x-show="isMeasurementFormOpen(srv.id, s.id)">
                       <legend>Nuovo punto di misura su <code x-text="s.id"></code></legend>
                       <div class="form-grid">
-                        <label class="form-field" title="Sceglie un preset dal catalogo: pre-popola tutti i campi con i valori tipici di quel tipo di sensore. Puoi sempre modificarli prima di salvare.">
+                        <label class="form-field form-field-wide" title="Sceglie un preset dal catalogo: pre-popola tutti i campi con i valori tipici di quel tipo di sensore. Puoi sempre modificarli prima di salvare.">
                           <span>Preset</span>
                           <select :value="measurementForm(srv.id, s.id).template_name"
                                   @change="applyTemplateToForm(srv.id, s.id, $event.target.value)">
@@ -357,6 +357,15 @@
                               <option :value="t.name" x-text="t.label + ' (' + t.data_type + ')'"></option>
                             </template>
                           </select>
+                          <template x-if="selectedTemplate(srv.id, s.id)">
+                            <div class="template-info">
+                              <p class="template-desc" x-text="selectedTemplate(srv.id, s.id).description"></p>
+                              <p class="template-consumer">
+                                <strong>Lettura lato consumer:</strong>
+                                <span x-text="consumerReadHint(selectedTemplate(srv.id, s.id))"></span>
+                              </p>
+                            </div>
+                          </template>
                         </label>
                         <label class="form-field">
                           <span>Nome <em>*</em></span>
@@ -388,7 +397,7 @@
                             </template>
                           </select>
                         </label>
-                        <label class="form-field" title="Fattore di scala applicato al valore generato prima della codifica. Tipico: 10 su int per ottenere risoluzione 0.1, 1 su float.">
+                        <label class="form-field" title="Documentazione consumer-side. Il consumer Modbus deve dividere il valore di registro per questo factor per ottenere unità ingegneristiche. scale=1 ⇒ nessuna conversione (valore di registro = valore reale). scale=10 ⇒ 0.1 di risoluzione (es. registro 253 ⇒ 25.3). scale=100 ⇒ 0.01 di risoluzione.">
                           <span>Scale</span>
                           <input type="number" step="0.1"
                                  x-model.number="measurementForm(srv.id, s.id).scale" />
@@ -534,6 +543,12 @@
                                       @click="deleteMeasurement(srv.id, s.id, m.name)">
                                 ×
                               </button>
+                            </td>
+                          </tr>
+                          <tr class="consumer-row">
+                            <td colspan="10">
+                              <span class="consumer-label">Lettura lato consumer (gateway/SCADA):</span>
+                              <span class="consumer-hint" x-text="consumerReadHintForMeasurement(m)"></span>
                             </td>
                           </tr>
                           <template x-if="measurementWarnings(m).length > 0">
