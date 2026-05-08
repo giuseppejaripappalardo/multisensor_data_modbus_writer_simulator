@@ -79,5 +79,42 @@ servers:
       offline: false
       error_rate: 0.0
       error_code: 11
+- id: test1
+  label: null
+  description: null
+  host: 127.0.0.1
+  port: 5020
+  default_unit_id: 1
+  register_count_min: 200
+  auto_start: false
+  sensors:
+  - id: s1
+    unit_id: 1
+    base_address: 0
+    byte_order: big
+    word_order: big
+    write_rate_seconds: 1.0
+    measurements:
+    - name: pac2200_p_total
+      offset: 0
+      register_type: holding_register
+      data_type: float32
+      scale: 1.0
+      min_value: -6000000.0
+      max_value: 6000000.0
+      update_rate: 1.0
+      unit: W
+      fault:
+        error_rate: 0.0
+        error_code: 2
+        frozen: false
+        drop_writes: false
+        bit_flip_rate: 0.0
+        drift_per_second: 0.0
+    fault:
+      latency_ms: 0
+      offline: false
+      error_rate: 0.0
+      error_code: 11
 tick_seconds: 0.5
 log_level: INFO

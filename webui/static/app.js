@@ -467,8 +467,39 @@ document.addEventListener("alpine:init", () => {
         rt,
       };
     },
-    consumerReadHintForMeasurement(m) {
-      // Versione per misure già configurate (non template).
+    // Etichetta "umana" per la combinazione (byte_order, word_order) effettiva.
+    // Per i tipi a 16 bit il word_order è inerte (un solo registro).
+    endianLabel(dt, byteOrder, wordOrder) {
+      const bo = byteOrder || "big";
+      const wo = wordOrder || "big";
+      if (dt === "bool") return "—";
+      if (dt === "uint16" || dt === "int16") {
+        return bo === "big" ? "byte_order=big (1 reg)" : "byte_order=little (1 reg, byte swap)";
+      }
+      // Multi-register: nominiamo le 4 combinazioni col pattern di byte
+      // sulla rete, nello stesso ordine in cui le scrive l'encoder.
+      const pattern = (bo === "big" && wo === "big") ? "ABCD"
+                    : (bo === "big" && wo === "little") ? "CDAB"
+                    : (bo === "little" && wo === "big") ? "BADC"
+                    : "DCBA";
+      const human = (bo === "big" && wo === "big") ? "Big endian"
+                  : (bo === "big" && wo === "little") ? "Word-swap (mid-little)"
+                  : (bo === "little" && wo === "big") ? "Byte-swap (mid-big)"
+                  : "Little endian";
+      return `${human} (${pattern}: byte_order=${bo}, word_order=${wo})`;
+    },
+    // Prefisso "umano" del registro per ciascuno dei 4 spazi Modbus.
+    // 0xxxx coil, 1xxxx discrete input, 3xxxx input register, 4xxxx holding.
+    addrBaseFor(rt) {
+      return ({
+        coil: 1, discrete_input: 10001,
+        input_register: 30001, holding_register: 40001,
+      })[rt] || 40001;
+    },
+    consumerReadHintForMeasurement(sensor, m) {
+      // Versione per misure già configurate (non template). Riflette il
+      // byte_order/word_order EFFETTIVO del sensore e lo SPAZIO Modbus
+      // della misura (non assumere holding).
       if (!m) return "";
       const dt = m.data_type;
       const wordCount = ({
@@ -476,13 +507,12 @@ document.addEventListener("alpine:init", () => {
         uint32: 2, int32: 2, float32: 2,
         float64: 4,
       })[dt] || 1;
-      const endian = (dt === "uint16" || dt === "int16" || dt === "bool")
-        ? "Big endian (1 reg)"
-        : "Big endian (ABCD: byte_order=big, word_order=big)";
+      const endian = this.endianLabel(dt, sensor && sensor.byte_order, sensor && sensor.word_order);
       const scaleHint = (Number(m.scale) === 1)
         ? "scale=1 ⇒ valore_reale = valore_registro"
         : `scale=${m.scale} ⇒ valore_reale = valore_registro / ${m.scale}`;
-      const addr = (typeof m.address === "number") ? `@${40001 + m.address}` : `offset ${m.offset}`;
+      const base = this.addrBaseFor(m.register_type);
+      const addr = (typeof m.address === "number") ? `@${base + m.address}` : `offset ${m.offset}`;
       return `${addr}, ${dt}, ${wordCount} reg, ${endian}. ${scaleHint}. Unità: ${m.unit || "—"}.`;
     },
     applyTemplateToForm(serverId, sensorId, templateName) {

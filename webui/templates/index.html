@@ -312,20 +312,18 @@
                       </label>
                       <label title="Modificabile solo a server fermo.">
                         Byte order
-                        <select :value="s.byte_order"
-                                :disabled="isLocked(srv.id)"
+                        <select :disabled="isLocked(srv.id)"
                                 @change="patchSensor(srv.id, s.id, { byte_order: $event.target.value })">
-                          <option value="big">big</option>
-                          <option value="little">little</option>
+                          <option value="big" :selected="s.byte_order === 'big'">big</option>
+                          <option value="little" :selected="s.byte_order === 'little'">little</option>
                         </select>
                       </label>
                       <label title="Modificabile solo a server fermo.">
                         Word order
-                        <select :value="s.word_order"
-                                :disabled="isLocked(srv.id)"
+                        <select :disabled="isLocked(srv.id)"
                                 @change="patchSensor(srv.id, s.id, { word_order: $event.target.value })">
-                          <option value="big">big</option>
-                          <option value="little">little</option>
+                          <option value="big" :selected="s.word_order === 'big'">big</option>
+                          <option value="little" :selected="s.word_order === 'little'">little</option>
                         </select>
                       </label>
                       <label title="Periodo minimo tra due scritture per qualunque punto di questo sensore. Funge da CAP: nessun punto sarà aggiornato più velocemente. Il periodo effettivo di ogni punto è max(periodo punto, periodo sensore). Sempre modificabile (live-reload).">
@@ -372,11 +370,12 @@
                       <div class="form-grid">
                         <label class="form-field form-field-wide" title="Sceglie un preset dal catalogo: pre-popola tutti i campi con i valori tipici di quel tipo di sensore. Puoi sempre modificarli prima di salvare.">
                           <span>Preset</span>
-                          <select :value="measurementForm(srv.id, s.id).template_name"
-                                  @change="applyTemplateToForm(srv.id, s.id, $event.target.value)">
-                            <option value="">— personalizzato —</option>
+                          <select @change="applyTemplateToForm(srv.id, s.id, $event.target.value)">
+                            <option value="" :selected="!measurementForm(srv.id, s.id).template_name">— personalizzato —</option>
                             <template x-for="t in catalog" :key="t.name">
-                              <option :value="t.name" x-text="t.label + ' (' + t.data_type + ')'"></option>
+                              <option :value="t.name"
+                                      :selected="t.name === measurementForm(srv.id, s.id).template_name"
+                                      x-text="t.label + ' (' + t.data_type + ')'"></option>
                             </template>
                           </select>
                           <template x-if="selectedTemplate(srv.id, s.id)">
@@ -445,10 +444,11 @@
                         </label>
                         <label class="form-field" title="Spazio Modbus dove scrivere la misura. I 4 spazi sono indipendenti.">
                           <span>Spazio</span>
-                          <select :value="measurementForm(srv.id, s.id).register_type"
-                                  @change="onMeasurementFormRtChange(srv.id, s.id, $event.target.value)">
+                          <select @change="onMeasurementFormRtChange(srv.id, s.id, $event.target.value)">
                             <template x-for="rt in registerTypes" :key="rt">
-                              <option :value="rt" x-text="rtLabel(rt)"></option>
+                              <option :value="rt"
+                                      :selected="rt === measurementForm(srv.id, s.id).register_type"
+                                      x-text="rtLabel(rt)"></option>
                             </template>
                           </select>
                         </label>
@@ -459,11 +459,12 @@
                         </label>
                         <label class="form-field" title="Tipo dato Modbus. Sui coil/discrete input è forzato a bool (singolo bit). Sugli input/holding register il bool non è offerto: per gli stati 'a bit' usa una bitmask UINT16.">
                           <span>Data type</span>
-                          <select :value="measurementForm(srv.id, s.id).data_type"
-                                  :disabled="isBitSpace(measurementForm(srv.id, s.id).register_type)"
+                          <select :disabled="isBitSpace(measurementForm(srv.id, s.id).register_type)"
                                   @change="measurementForm(srv.id, s.id).data_type = $event.target.value">
                             <template x-for="dt in dataTypesFor(measurementForm(srv.id, s.id).register_type)" :key="dt">
-                              <option :value="dt" x-text="dt"></option>
+                              <option :value="dt"
+                                      :selected="dt === measurementForm(srv.id, s.id).data_type"
+                                      x-text="dt"></option>
                             </template>
                           </select>
                         </label>
@@ -545,20 +546,20 @@
                                      @change="patchMeasurement(srv.id, s.id, m.name, { offset: +$event.target.value })" />
                             </td>
                             <td>
-                              <select :value="m.register_type"
-                                      :disabled="isLocked(srv.id)"
+                              <select :disabled="isLocked(srv.id)"
                                       @change="patchMeasurement(srv.id, s.id, m.name, { register_type: $event.target.value })">
                                 <template x-for="rt in registerTypes" :key="rt">
-                                  <option :value="rt" x-text="rtLabel(rt)"></option>
+                                  <option :value="rt"
+                                          :selected="rt === m.register_type"
+                                          x-text="rtLabel(rt)"></option>
                                 </template>
                               </select>
                             </td>
                             <td>
-                              <select :value="m.data_type"
-                                      :disabled="isLocked(srv.id) || isBitSpace(m.register_type)"
+                              <select :disabled="isLocked(srv.id) || isBitSpace(m.register_type)"
                                       :title="isBitSpace(m.register_type) ? 'Su coil/discrete input il tipo è sempre bool (1 bit).' : 'Su input/holding register bool non è offerto: per stati a bit usa una bitmask UINT16.'"
                                       @change="patchMeasurement(srv.id, s.id, m.name, { data_type: $event.target.value })">
-                                <template x-for="dt in dataTypesFor(m.register_type)" :key="dt"><option :value="dt" x-text="dt"></option></template>
+                                <template x-for="dt in dataTypesFor(m.register_type)" :key="dt"><option :value="dt" :selected="dt === m.data_type" x-text="dt"></option></template>
                               </select>
                             </td>
                             <td>
@@ -619,7 +620,7 @@
                           <tr class="consumer-row">
                             <td colspan="10">
                               <span class="consumer-label">Lettura lato consumer (gateway/SCADA):</span>
-                              <span class="consumer-hint" x-text="consumerReadHintForMeasurement(m)"></span>
+                              <span class="consumer-hint" x-text="consumerReadHintForMeasurement(s, m)"></span>
                             </td>
                           </tr>
                           <template x-if="measurementWarnings(m).length > 0">

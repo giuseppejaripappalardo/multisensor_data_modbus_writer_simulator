@@ -36,7 +36,14 @@
       "WebFetch(domain:reset.build)",
       "WebFetch(domain:publikacje.siemens-info.com)",
       "WebFetch(domain:hvac.de)",
-      "WebFetch(domain:uk.rs-online.com)"
+      "WebFetch(domain:uk.rs-online.com)",
+      "Bash(playwright install *)",
+      "Bash(node repro.mjs)",
+      "Bash(node -e \"const m = require\\('alpinejs'\\); console.log\\('keys:', Object.keys\\(m\\).slice\\(0,20\\)\\); console.log\\('default keys:', m.default && Object.keys\\(m.default\\).slice\\(0,20\\)\\);\")",
+      "Bash(node -e ' *)",
+      "Bash(node repro2.mjs)",
+      "Bash(node fix.mjs)",
+      "Bash(node fix2.mjs)"
     ]
   }
 }
