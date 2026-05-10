@@ -1142,10 +1142,116 @@ ACS580_TEMPLATES: List[MeasurementTemplate] = [
 
 
 # ============================================================================
+# Eastron SDM120 / SDM230 — Energy Meter monofase
+# ============================================================================
+# Contatori di energia DIN-rail diffusissimi nel BMS italiano. Espongono via
+# Modbus RTU/TCP la mappa "de facto standard" dei moderni energy meter:
+# misure istantanee (V, I, P, PF, Hz) + totalizzatori di energia (kWh).
+#
+# Convenzioni dati:
+#   - Tutti i registri sono FLOAT32 IEEE 754 big-endian (ABCD), 2 reg ciascuno.
+#   - Sono Input Register (R/O), si leggono via FC 0x04.
+#   - Indirizzamento 30001-based: offset PDU 0 → @30001, offset 342 → @30343.
+#   - scale = 1.0 ovunque (valori già in unità ingegneristiche).
+#   - Slave ID default 1 (configurabile 1-247).
+#
+# Total Active Energy (kWh) è un contatore monotonico crescente. Float32 ha
+# range fino a 3.4e38 quindi non wrappa mai in pratica per applicazioni reali.
+#
+# Riferimento: Eastron SDM120/SDM230 Modbus protocol document v1.6.
+# ============================================================================
+
+SDM_TEMPLATES: List[MeasurementTemplate] = [
+    MeasurementTemplate(
+        name="sdm_voltage",
+        label="SDM120 · Tensione · @30001 · FLOAT32 ABCD · scale=1 · V",
+        unit="V",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=0.0, max_value=300.0, update_rate=1.0,
+        description=(
+            "Eastron SDM120/SDM230 · Tensione di linea (monofase). "
+            "Indirizzo: 30001 (offset 0), 2 registri FLOAT32 big-endian (ABCD). "
+            "Scale: 1.0 (valore già in V). Read-Only via FC 0x04 (Input Register). "
+            "Slave ID default 1. Range tipico rete LV: 220-240 V."
+        ),
+    ),
+    MeasurementTemplate(
+        name="sdm_current",
+        label="SDM120 · Corrente · @30007 · FLOAT32 ABCD · scale=1 · A",
+        unit="A",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=0.0, max_value=100.0, update_rate=1.0,
+        description=(
+            "Eastron SDM120/SDM230 · Corrente di linea. "
+            "Indirizzo: 30007 (offset 6), FLOAT32 ABCD, scale 1.0. "
+            "FC 0x04. Range SDM120: 0-45 A; SDM230: 0-100 A."
+        ),
+    ),
+    MeasurementTemplate(
+        name="sdm_active_power",
+        label="SDM120 · Potenza attiva · @30013 · FLOAT32 ABCD · scale=1 · W",
+        unit="W",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=-25_000.0, max_value=25_000.0, update_rate=1.0,
+        description=(
+            "Eastron SDM120/SDM230 · Potenza attiva istantanea. "
+            "Indirizzo: 30013 (offset 12), FLOAT32 ABCD, scale 1.0. "
+            "FC 0x04. Segno: positivo = import, negativo = export."
+        ),
+    ),
+    MeasurementTemplate(
+        name="sdm_pf_total",
+        label="SDM120 · Power Factor · @30031 · FLOAT32 ABCD · scale=1 · —",
+        unit="",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=-1.0, max_value=1.0, update_rate=1.0,
+        description=(
+            "Eastron SDM120/SDM230 · Power factor (P/S). "
+            "Indirizzo: 30031 (offset 30), FLOAT32 ABCD, scale 1.0. "
+            "FC 0x04. Range: -1..+1. Tipico uffici: 0.92..0.97 induttivo."
+        ),
+    ),
+    MeasurementTemplate(
+        name="sdm_frequency",
+        label="SDM120 · Frequenza · @30071 · FLOAT32 ABCD · scale=1 · Hz",
+        unit="Hz",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=45.0, max_value=65.0, update_rate=1.0,
+        description=(
+            "Eastron SDM120/SDM230 · Frequenza di rete. "
+            "Indirizzo: 30071 (offset 70), FLOAT32 ABCD, scale 1.0. "
+            "FC 0x04. Range tipico Europa: 49.95-50.05 Hz."
+        ),
+    ),
+    MeasurementTemplate(
+        name="sdm_total_active_energy",
+        label="SDM120 · Energia attiva totale · @30343 · FLOAT32 ABCD · scale=1 · kWh",
+        unit="kWh",
+        register_type=RegisterType.INPUT_REGISTER,
+        data_type=DataType.FLOAT32, scale=1.0,
+        min_value=0.0, max_value=1.0e9, update_rate=10.0,
+        description=(
+            "Eastron SDM120/SDM230 · Total Active Energy (contatore cumulativo). "
+            "Indirizzo: 30343 (offset 342), 2 registri FLOAT32 big-endian (ABCD). "
+            "Scale: 1.0 (valore in kWh diretto). FC 0x04 (Input Register). "
+            "Pattern industriale standard: monotonico strettamente crescente, "
+            "Float32 range >3e38 → no wrap-around in pratica. Polling 30-60 s "
+            "consigliato lato consumer."
+        ),
+    ),
+]
+
+
+# ============================================================================
 # Catalogo unificato
 # ============================================================================
 CATALOG: List[MeasurementTemplate] = (
-    PAC2200_TEMPLATES + QNA_TEMPLATES + ACS580_TEMPLATES
+    PAC2200_TEMPLATES + QNA_TEMPLATES + ACS580_TEMPLATES + SDM_TEMPLATES
 )
 
 

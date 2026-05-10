@@ -14,7 +14,12 @@ generators:
 - Siemens QNA2820D (sensore ambientale IAQ via gateway LoRaWAN→Modbus): T,
   RH, CO2, TVOC, PM2.5, PM10, sound, illuminance — pattern indoor verosimili,
   con correlazione tra CO2/TVOC e tra PM2.5/PM10.
+
+- Eastron SDM120/SDM230 (energy meter monofase): V → I ← P ← curva oraria
+  wall-clock (uffici italiano) → PF → Hz → kWh totale (counter monotonico
+  Float32 integrato in tempo reale).
 """
+import datetime
 import hashlib
 import math
 import random
@@ -132,6 +137,12 @@ class SensorGenerator:
             "pac2200_ereact_imp_t1": 7, "pac2200_ereact_imp_t2": 7,
             "pac2200_ereact_exp_t1": 7, "pac2200_ereact_exp_t2": 7,
             "pac2200_eapp_t1": 7, "pac2200_eapp_t2": 7,
+            # SDM120/SDM230: V/PF/Hz indipendenti, P deriva dalla curva oraria,
+            # I deriva da P/V/PF, kWh integra P nel tempo (deve venire dopo).
+            "sdm_voltage": 0, "sdm_pf_total": 0, "sdm_frequency": 0,
+            "sdm_active_power": 1,
+            "sdm_current": 2,
+            "sdm_total_active_energy": 3,
         }
         names = list(self._measurements.keys())
         names.sort(key=lambda n: priorities.get(n, 0))
@@ -761,6 +772,107 @@ class SensorGenerator:
             return 30.0 + self.rng.gauss(0, 10)
 
     # =========================================================================
+    # Eastron SDM120 / SDM230 — Energy Meter monofase (wall-clock office curve)
+    # =========================================================================
+
+    # Curva di carico tipica edificio uffici italiano. Tuple (ora_inizio, kW_base).
+    # L'ora finale si chiude implicitamente con il primo elemento (24h cyclic).
+    _SDM_OFFICE_LOAD_CURVE = (
+        (0.0, 1.0),    # 00-06: minimi notturni (server, frigo, luci emergenza)
+        (6.0, 1.5),    # 06-08: rampa di accensione progressiva
+        (8.0, 8.5),    # 08-13: pieno regime mattina
+        (13.0, 5.0),   # 13-14: pausa pranzo (carichi parziali)
+        (14.0, 9.0),   # 14-18: pieno regime pomeriggio
+        (18.0, 3.0),   # 18-22: spegnimento progressivo
+        (22.0, 1.0),   # 22-24: ritorno a base notturna
+    )
+
+    @classmethod
+    def _sdm_load_kw_for_hour(cls, hour: float) -> float:
+        """Interpola linearmente la curva oraria per una data ora del giorno (0..24)."""
+        curve = cls._SDM_OFFICE_LOAD_CURVE
+        for i, (h0, kw0) in enumerate(curve):
+            h1 = curve[(i + 1) % len(curve)][0]
+            kw1 = curve[(i + 1) % len(curve)][1]
+            if h1 <= h0:  # wrap mezzanotte
+                h1 += 24.0
+            h_check = hour if hour >= h0 else hour + 24.0
+            if h0 <= h_check < h1:
+                frac = (h_check - h0) / (h1 - h0)
+                return kw0 + (kw1 - kw0) * frac
+        return curve[0][1]  # fallback
+
+    def _sdm_ensure_state(self, t: float) -> None:
+        """
+        Cache shared SDM state per tick: P (W), V, PF, Hz.
+
+        La curva di carico è basata sull'ora del giorno wall-clock (datetime.now).
+        Il counter kWh viene poi integrato usando dt dal `t` simulato.
+        """
+        if self._state.get("_sdm_t") == t:
+            return
+        self._state["_sdm_t"] = t
+
+        now = datetime.datetime.now()
+        hour_of_day = now.hour + now.minute / 60.0 + now.second / 3600.0
+        base_kw = self._sdm_load_kw_for_hour(hour_of_day)
+        # Jitter ±10% (gauss) + rumore sub-secondo per realismo.
+        jitter = 1.0 + self.rng.gauss(0, 0.10)
+        sub_minute = math.sin(t / 23.0) * 0.04
+        load_kw = max(0.0, base_kw * jitter * (1.0 + sub_minute))
+
+        self._state["_sdm_load_kw"] = load_kw
+        self._state["_sdm_active_power_w"] = load_kw * 1000.0
+        self._state["_sdm_v"] = 230.0 + math.sin(t / 60.0) * 1.2 + self.rng.gauss(0, 0.3)
+        # Uffici: PF leggermente induttivo, peggiora un po' a basso carico
+        # (effetto dei carichi capacitivi/UPS senza compensazione).
+        pf_base = 0.95 - max(0.0, (2.0 - load_kw)) * 0.02
+        self._state["_sdm_pf"] = clamp(pf_base + self.rng.gauss(0, 0.005), 0.80, 0.99)
+        self._state["_sdm_f"] = 50.0 + math.sin(t / 30.0) * 0.03 + self.rng.gauss(0, 0.01)
+
+    def _gen_sdm_voltage(self, t: float) -> float:
+        self._sdm_ensure_state(t)
+        return self._state["_sdm_v"]
+
+    def _gen_sdm_pf_total(self, t: float) -> float:
+        self._sdm_ensure_state(t)
+        return self._state["_sdm_pf"]
+
+    def _gen_sdm_frequency(self, t: float) -> float:
+        self._sdm_ensure_state(t)
+        return self._state["_sdm_f"]
+
+    def _gen_sdm_active_power(self, t: float) -> float:
+        self._sdm_ensure_state(t)
+        return self._state["_sdm_active_power_w"]
+
+    def _gen_sdm_current(self, t: float) -> float:
+        self._sdm_ensure_state(t)
+        v = self._state["_sdm_v"]
+        pf = self._state["_sdm_pf"]
+        p = self._state["_sdm_active_power_w"]
+        denom = v * pf
+        return p / denom if denom > 1e-3 else 0.0
+
+    def _gen_sdm_total_active_energy(self, t: float) -> float:
+        """
+        Counter Float32 monotonico crescente (kWh). Inizializzato a 12000.0
+        per simulare un contatore in uso da circa un anno. Integra la
+        potenza attiva istantanea: ΔE [kWh] = P [kW] × Δt [h].
+        """
+        self._sdm_ensure_state(t)
+        last_t = self._state.get("_sdm_kwh_last_t")
+        counter = self._state.get("_sdm_kwh_counter", 12000.0)
+        if last_t is not None:
+            dt = t - last_t
+            load_kw = self._state.get("_sdm_load_kw", 0.0)
+            if dt > 0 and load_kw > 0:
+                counter += load_kw * dt / 3600.0
+        self._state["_sdm_kwh_counter"] = counter
+        self._state["_sdm_kwh_last_t"] = t
+        return counter
+
+    # =========================================================================
     # Generic fallback
     # =========================================================================
 
@@ -864,4 +976,11 @@ _GENERATORS = {
     "acs580_running_status": lambda self, t: self._gen_acs580_running_status(t),
     "acs580_fault_status":   lambda self, t: self._gen_acs580_fault_status(t),
     "acs580_at_setpoint":    lambda self, t: self._gen_acs580_at_setpoint(t),
+    # Eastron SDM120/SDM230 (energy meter monofase)
+    "sdm_voltage":              lambda self, t: self._gen_sdm_voltage(t),
+    "sdm_current":              lambda self, t: self._gen_sdm_current(t),
+    "sdm_active_power":         lambda self, t: self._gen_sdm_active_power(t),
+    "sdm_pf_total":             lambda self, t: self._gen_sdm_pf_total(t),
+    "sdm_frequency":            lambda self, t: self._gen_sdm_frequency(t),
+    "sdm_total_active_energy":  lambda self, t: self._gen_sdm_total_active_energy(t),
 }

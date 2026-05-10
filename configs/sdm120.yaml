@@ -1,0 +1,95 @@
+# ===========================================================================
+# Preset: Eastron SDM120 / SDM230 — Energy Meter monofase
+# ===========================================================================
+# Replica della register map standard SDM120/SDM230 (de facto standard nel
+# BMS italiano per energy meter monofase DIN-rail).
+#
+# Convenzioni:
+#   - Slave ID Modbus default 1 (configurabile 1-247).
+#   - Tutti i registri sono Input Register (FC 0x04, R/O).
+#   - FLOAT32 IEEE 754 big-endian (ABCD), 2 registri ciascuno.
+#   - Scale: 1.0 ovunque (valori già in unità ingegneristiche).
+#
+# La curva di consumo è basata sull'ora wall-clock del sistema (profilo
+# uffici italiano, 80-120 kWh/giorno con jitter ±10%). Il contatore
+# Total Active Energy parte da 12000.0 kWh e cresce in modo monotonico
+# integrando la potenza istantanea (P × Δt).
+#
+# Caricamento:
+#   python main.py --config configs/sdm120.yaml
+# ===========================================================================
+
+tick_seconds: 1.0
+log_level: INFO
+
+servers:
+  - id: sdm120_demo
+    label: SDM120 demo
+    description: Eastron SDM120 energy meter (replica register map)
+    host: 0.0.0.0
+    port: 5023
+    default_unit_id: 1
+    register_count_min: 512
+    auto_start: true
+    sensors:
+      - id: sdm120
+        unit_id: 1
+        base_address: 0
+        byte_order: big
+        word_order: big
+        write_rate_seconds: 1.0
+        measurements:
+          - name: sdm_voltage
+            offset: 0
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 300.0
+            update_rate: 1.0
+            unit: V
+          - name: sdm_current
+            offset: 6
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 100.0
+            update_rate: 1.0
+            unit: A
+          - name: sdm_active_power
+            offset: 12
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: -25000.0
+            max_value: 25000.0
+            update_rate: 1.0
+            unit: W
+          - name: sdm_pf_total
+            offset: 30
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: -1.0
+            max_value: 1.0
+            update_rate: 1.0
+            unit: ""
+          - name: sdm_frequency
+            offset: 70
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: 45.0
+            max_value: 65.0
+            update_rate: 1.0
+            unit: Hz
+          - name: sdm_total_active_energy
+            offset: 342
+            register_type: input_register
+            data_type: float32
+            scale: 1.0
+            min_value: 0.0
+            max_value: 1000000000.0
+            update_rate: 10.0
+            unit: kWh
