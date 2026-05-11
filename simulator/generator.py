@@ -67,6 +67,16 @@ class SensorGenerator:
 
         logger.debug(f"Initialized generator for '{sensor_id}' (seed={seed})")
 
+    def update_measurements(self, measurements: List[MeasurementConfig]) -> None:
+        """
+        Rebind the measurement set without touching accumulator state.
+
+        Used by the scheduler when the runtime config is reloaded live so
+        monotonic counters (kWh totalizers, run-hours, energie integrate) and
+        the RNG sequence survive edits to the sensor's measurement list.
+        """
+        self._measurements = {m.name: m for m in measurements}
+
     def generate(self, name: str, time_seconds: float) -> float:
         """Generate a value for the named measurement."""
         config = self._measurements.get(name)

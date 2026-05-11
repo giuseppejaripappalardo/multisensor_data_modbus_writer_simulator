@@ -213,12 +213,22 @@ class SensorSimulator:
         self._reset_state()
 
     def _reset_state(self) -> None:
+        # Reuse existing generators by sensor.id so monotonic counters
+        # (kWh, run_time, energie integrate) and the RNG sequence persist
+        # across live config reloads and stop/start cycles — real meters do
+        # not reset on a config edit or power cycle.
+        old_gens = self._generators
         gens: Dict[str, SensorGenerator] = {}
         last: Dict[str, Dict[str, float]] = {}
         frozen: Dict[str, Dict[str, float]] = {}
         drift: Dict[str, Dict[str, float]] = {}
         for sensor in self.server_config.sensors:
-            gens[sensor.id] = SensorGenerator(sensor.id, sensor.measurements)
+            existing = old_gens.get(sensor.id)
+            if existing is not None:
+                existing.update_measurements(sensor.measurements)
+                gens[sensor.id] = existing
+            else:
+                gens[sensor.id] = SensorGenerator(sensor.id, sensor.measurements)
             last[sensor.id] = {m.name: -float("inf") for m in sensor.measurements}
             frozen[sensor.id] = {}
             drift[sensor.id] = {m.name: 0.0 for m in sensor.measurements}
